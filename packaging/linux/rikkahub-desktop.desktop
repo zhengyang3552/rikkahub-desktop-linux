@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Rikkahub Desktop
+GenericName=AI Chat Client
+Comment=Native LLM chat client (OpenAI / Anthropic / Gemini / local models), opens in your browser
+Exec=rikkahub-desktop
+Icon=rikkahub-desktop
+Terminal=false
+Categories=Network;Chat;Utility;
+Keywords=ai;llm;chat;openai;claude;gemini;rikkahub;
