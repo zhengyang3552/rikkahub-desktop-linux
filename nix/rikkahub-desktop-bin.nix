@@ -40,7 +40,11 @@ stdenvNoCC.mkDerivation {
 
     mkdir -p "$out/opt/rikkahub-desktop" "$out/bin" "$out/share/applications" \
       "$out/share/icons/hicolor/192x192/apps"
-    cp -r rikkahub-pc/. "$out/opt/rikkahub-desktop/"
+    # tarball 仅含 rikkahub-pc/ 单顶层目录时,unpackPhase 会将其设为 sourceRoot
+    # 并已 cd 进去;布局变化(多顶层条目)时回退当前目录
+    SRC=.
+    if [ -d rikkahub-pc ]; then SRC=rikkahub-pc; fi
+    cp -r "$SRC/." "$out/opt/rikkahub-desktop/"
 
     # launcher.sh 中 /opt/rikkahub-desktop 替换为本 store 路径
     sed "s|/opt/rikkahub-desktop|$out/opt/rikkahub-desktop|g" \
