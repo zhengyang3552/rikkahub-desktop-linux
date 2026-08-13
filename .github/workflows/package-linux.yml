@@ -106,9 +106,9 @@ jobs:
           # sanity:缺了 index.html 页面会回退到 "web-ui is not built"
           test -f payload/rikkahub-pc/web-ui/build/client/index.html
 
-          cp packaging/linux/rikkahub-desktop.desktop payload/meta/
-          install -m755 packaging/linux/launcher.sh payload/meta/launcher.sh
-          install -m755 packaging/linux/appimage-apprun.sh payload/meta/apprun.sh
+          cp ci/linux/rikkahub-desktop.desktop payload/meta/
+          install -m755 ci/linux/launcher.sh payload/meta/launcher.sh
+          install -m755 ci/linux/appimage-apprun.sh payload/meta/apprun.sh
 
           # hicolor 图标集(源:docs/icon.png)
           IM="$(command -v magick || command -v convert)"
@@ -264,7 +264,7 @@ jobs:
         run: |
           nix-build --show-trace -E "
             let pkgs = import <nixpkgs> {};
-            in pkgs.callPackage ${GITHUB_WORKSPACE}/nix/rikkahub-desktop-bin.nix {
+            in pkgs.callPackage ${GITHUB_WORKSPACE}/ci/nix/rikkahub-desktop-bin.nix {
               version = \"${V}\";
               src = ${GITHUB_WORKSPACE}/Rikkahub_${V}_linux_x64.tar.gz;
             }"
@@ -277,7 +277,7 @@ jobs:
 
           mkdir -p nix-artifact
           cp "rikkahub-desktop-bin-${V}-nix-closure.tar.zst" nix-artifact/
-          cp nix/rikkahub-desktop-bin.nix nix-artifact/
+          cp ci/nix/rikkahub-desktop-bin.nix nix-artifact/
           {
             echo "# rikkahub-desktop-bin ${V} — NixOS 二进制包"
             echo ""

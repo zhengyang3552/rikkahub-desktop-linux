@@ -6,7 +6,7 @@
 #
 # CI 用法(本地 src,见 .github/workflows/package-linux.yml):
 #   nix-build -E 'let pkgs = import <nixpkgs> {};
-#     in pkgs.callPackage ./nix/rikkahub-desktop-bin.nix { version = "1.5.0"; src = ./Rikkahub_1.5.0_linux_x64.tar.gz; }'
+#     in pkgs.callPackage ./ci/nix/rikkahub-desktop-bin.nix { version = "1.5.0"; src = ./Rikkahub_1.5.0_linux_x64.tar.gz; }'
 #
 # 从 Release 资产构建:
 #   nix-build -E '(import <nixpkgs> {}).callPackage ./rikkahub-desktop-bin.nix {
@@ -48,12 +48,12 @@ stdenvNoCC.mkDerivation {
 
     # launcher.sh 中 /opt/rikkahub-desktop 替换为本 store 路径
     sed "s|/opt/rikkahub-desktop|$out/opt/rikkahub-desktop|g" \
-      ${../packaging/linux/launcher.sh} > "$out/bin/rikkahub-desktop"
+      ${../linux/launcher.sh} > "$out/bin/rikkahub-desktop"
     chmod 755 "$out/bin/rikkahub-desktop"
 
-    install -m644 ${../packaging/linux/rikkahub-desktop.desktop} \
+    install -m644 ${../linux/rikkahub-desktop.desktop} \
       "$out/share/applications/rikkahub-desktop.desktop"
-    install -m644 ${../docs/icon.png} \
+    install -m644 ${../../docs/icon.png} \
       "$out/share/icons/hicolor/192x192/apps/rikkahub-desktop.png"
 
     runHook postInstall

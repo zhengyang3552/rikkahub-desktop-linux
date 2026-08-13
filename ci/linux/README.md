@@ -21,13 +21,13 @@
 + `fonts/` + `icons/`。二进制必须与 `web-ui/` 同目录——`pc-server/foundation/paths.ts`
 按 "exe 同目录存在 web-ui/" 定位静态资源。
 
-命令统一为 `rikkahub-desktop`(`packaging/linux/launcher.sh` 生成)。
+命令统一为 `rikkahub-desktop`(`ci/linux/launcher.sh` 生成)。
 安装目录只读,因此数据目录(会话、设置、上传文件、API Key)默认落到
 `~/.local/share/rikkahub-desktop`,由启动器设置 `RIKKAHUB_PC_DATA_DIR`
 (该环境变量为 `foundation/paths.ts` 的官方覆盖入口),用户可自行改指。
 
 AppImage 为只读 squashfs,同理把数据落用户目录;`AppRun` 由
-`packaging/linux/appimage-apprun.sh` 生成。
+`ci/linux/appimage-apprun.sh` 生成。
 
 ## 文件
 
