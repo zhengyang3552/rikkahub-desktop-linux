@@ -1,0 +1,353 @@
+name: Package Linux
+
+# 仓库从上游同步(push 到 main)后自动编译并打包全部 Linux 发行版格式;也可手动触发。
+#
+# 产物(均为 amd64 / x86_64):
+#   - Rikkahub_<ver>_linux_x64.tar.gz                便携 tar.gz(应用内更新按 *_linux_x64.tar.gz 匹配,文件名勿改)
+#   - rikkahub-desktop_<ver>_amd64.deb               Debian / Ubuntu / Mint
+#   - rikkahub-desktop-<ver>-1-x86_64.pkg.tar.zst    Arch / Manjaro
+#   - rikkahub-desktop-<ver>-x86_64.AppImage         AppImage
+#   - rikkahub-desktop-bin-<ver>-nix/                NixOS 二进制包(nix-store closure 导出 + derivation)
+#   - rikkahub-desktop-<ver>.tar.gz                  源码包(git archive)
+#
+# 打包布局约定:
+#   /opt/rikkahub-desktop/   rikkahub-pc 二进制 + web-ui/build/client + fonts + icons
+#                            (二进制必须与 web-ui/ 同目录,foundation/paths.ts 按此定位静态资源)
+#   /usr/bin/rikkahub-desktop  启动器,数据目录默认 ~/.local/share/rikkahub-desktop
+#                              (RIKKAHUB_PC_DATA_DIR 可覆盖;安装目录只读,数据必须落用户目录)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号覆盖(默认取 pc-server/updates/index.ts 的 APP_VERSION)'
+        required: false
+        default: ''
+
+concurrency:
+  group: package-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # 与 build-linux.yml / ci.yml 保持一致;升级 Bun 时同步改
+  BUN_VERSION: '1.3.13'
+
+jobs:
+  build:
+    name: Compile (web-ui + bun binary)
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version || '' }}" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="$(grep -oP 'APP_VERSION = "\K[^"]+' pc-server/updates/index.ts)"
+          fi
+          if [ -z "$V" ]; then
+            echo "::error::无法解析版本号"
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Version: $V"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      # react-router build 在 SPA 模式下引用 react-dom/server,Bun 自带版本缺
+      # renderToPipeableStream 会报错——换成 Node 版(与 build-linux.yml 相同处理)。
+      - name: Build web-ui
+        working-directory: web-ui
+        run: |
+          bun install --frozen-lockfile
+          rm -f node_modules/react-dom/server.bun.js
+          ln -sf server.node.js node_modules/react-dom/server.bun.js
+          rm -f node_modules/react-dom/cjs/react-dom-server.bun.development.js
+          ln -sf react-dom-server.node.development.js node_modules/react-dom/cjs/react-dom-server.bun.development.js
+          rm -f node_modules/react-dom/cjs/react-dom-server.bun.production.js
+          ln -sf react-dom-server.node.production.js node_modules/react-dom/cjs/react-dom-server.bun.production.js
+          bun run build
+
+      # mupdf 的 wasm 必须先存在于 node_modules,bun --compile 才能将其嵌入单文件二进制
+      - name: Compile Linux x64 binary
+        working-directory: pc-server
+        run: |
+          bun install --frozen-lockfile
+          bun build --compile --target=bun-linux-x64 server.ts --outfile ../dist/rikkahub-pc
+          chmod +x ../dist/rikkahub-pc
+          test -x ../dist/rikkahub-pc
+
+      - name: Assemble payload
+        run: |
+          mkdir -p payload/rikkahub-pc/web-ui/build payload/meta/icons
+          cp dist/rikkahub-pc payload/rikkahub-pc/rikkahub-pc
+          cp -r web-ui/build/client payload/rikkahub-pc/web-ui/build/client
+          cp -r fonts payload/rikkahub-pc/fonts
+          cp -r icons payload/rikkahub-pc/icons
+          # sanity:缺了 index.html 页面会回退到 "web-ui is not built"
+          test -f payload/rikkahub-pc/web-ui/build/client/index.html
+
+          cp packaging/linux/rikkahub-desktop.desktop payload/meta/
+          install -m755 packaging/linux/launcher.sh payload/meta/launcher.sh
+          install -m755 packaging/linux/appimage-apprun.sh payload/meta/apprun.sh
+
+          # hicolor 图标集(源:docs/icon.png)
+          IM="$(command -v magick || command -v convert)"
+          for s in 32 48 64 128 256; do
+            "$IM" docs/icon.png -resize "${s}x${s}" "payload/meta/icons/rikkahub-desktop-${s}.png"
+          done
+          echo "${{ steps.ver.outputs.version }}" > payload/version.txt
+
+      - name: Upload payload
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-payload
+          path: payload
+          retention-days: 7
+
+  package:
+    name: Package (deb / arch / appimage / nix / tar.gz)
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      V: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download payload
+        uses: actions/download-artifact@v7
+        with:
+          name: linux-payload
+          path: .
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd libarchive-tools >/dev/null
+
+      # ── 1) 便携 tar.gz(命名与应用内更新匹配规则一致,勿改)──────────────
+      - name: Package portable tar.gz
+        run: |
+          cd payload
+          tar czf "../Rikkahub_${V}_linux_x64.tar.gz" rikkahub-pc/
+          ls -lh "../Rikkahub_${V}_linux_x64.tar.gz"
+
+      # ── 2) Debian 包(amd64)────────────────────────────────────────────
+      - name: Build deb (amd64)
+        run: |
+          ROOT=debroot
+          mkdir -p "$ROOT/DEBIAN" "$ROOT/opt/rikkahub-desktop" "$ROOT/usr/bin" \
+            "$ROOT/usr/share/applications"
+          cp -r payload/rikkahub-pc/. "$ROOT/opt/rikkahub-desktop/"
+          install -m755 payload/meta/launcher.sh "$ROOT/usr/bin/rikkahub-desktop"
+          install -m644 payload/meta/rikkahub-desktop.desktop "$ROOT/usr/share/applications/"
+          for s in 32 48 64 128 256; do
+            install -Dm644 "payload/meta/icons/rikkahub-desktop-${s}.png" \
+              "$ROOT/usr/share/icons/hicolor/${s}x${s}/apps/rikkahub-desktop.png"
+          done
+
+          INSTALLED_SIZE="$(du -sk --exclude=DEBIAN "$ROOT" | cut -f1)"
+          {
+            echo "Package: rikkahub-desktop"
+            echo "Version: ${V}"
+            echo "Section: net"
+            echo "Priority: optional"
+            echo "Architecture: amd64"
+            echo "Maintainer: zhengyang3552 <zhengyang3552@users.noreply.github.com>"
+            echo "Installed-Size: ${INSTALLED_SIZE}"
+            echo "Homepage: https://github.com/zhengyang3552/rikkahub-desktop-Linux"
+            echo "Description: Rikkahub desktop LLM chat client for Linux"
+            echo " Native LLM client with multi-provider support (OpenAI / Anthropic /"
+            echo " Gemini / OpenAI-compatible endpoints), MCP tools, web search, image"
+            echo " generation and local model support (Ollama / LM Studio / llama.cpp)."
+            echo " Runs a local server at http://localhost:8080 and opens the UI in"
+            echo " your default browser. Data is stored in"
+            echo " ~/.local/share/rikkahub-desktop (override: RIKKAHUB_PC_DATA_DIR)."
+          } > "$ROOT/DEBIAN/control"
+
+          dpkg-deb --build --root-owner-group "$ROOT" "rikkahub-desktop_${V}_amd64.deb"
+          dpkg-deb --info "rikkahub-desktop_${V}_amd64.deb"
+
+      # ── 3) Arch 包(x86_64, .pkg.tar.zst)──────────────────────────────
+      - name: Build Arch pkg.tar.zst (x86_64)
+        run: |
+          ROOT=archroot
+          mkdir -p "$ROOT/opt/rikkahub-desktop" "$ROOT/usr/bin" "$ROOT/usr/share/applications"
+          cp -r payload/rikkahub-pc/. "$ROOT/opt/rikkahub-desktop/"
+          install -m755 payload/meta/launcher.sh "$ROOT/usr/bin/rikkahub-desktop"
+          install -m644 payload/meta/rikkahub-desktop.desktop "$ROOT/usr/share/applications/"
+          for s in 32 48 64 128 256; do
+            install -Dm644 "payload/meta/icons/rikkahub-desktop-${s}.png" \
+              "$ROOT/usr/share/icons/hicolor/${s}x${s}/apps/rikkahub-desktop.png"
+          done
+
+          SIZE="$(du -sb "$ROOT" | cut -f1)"
+          {
+            echo "pkgname = rikkahub-desktop"
+            echo "pkgver = ${V}-1"
+            echo "pkgdesc = Rikkahub desktop LLM chat client (self-contained Linux binary)"
+            echo "url = https://github.com/zhengyang3552/rikkahub-desktop-Linux"
+            echo "builddate = $(date +%s)"
+            echo "packager = rikkahub-desktop-Linux CI"
+            echo "size = ${SIZE}"
+            echo "arch = x86_64"
+            echo "license = custom"
+            echo "depend = glibc"
+          } > "$ROOT/.PKGINFO"
+
+          # .MTREE 与 makepkg 相同的字段集;包内文件强制 root:root
+          ( cd "$ROOT" && bsdtar --uid 0 --gid 0 --uname root --gname root \
+              -czf .MTREE --format mtree \
+              --options '!all,use-set,type,uid,gid,mode,time,size,md5,sha256,link' \
+              .PKGINFO usr opt )
+          ( cd "$ROOT" && bsdtar --uid 0 --gid 0 --uname root --gname root \
+              --zstd -cf "../rikkahub-desktop-${V}-1-x86_64.pkg.tar.zst" \
+              .PKGINFO .MTREE usr opt )
+          ls -lh "rikkahub-desktop-${V}-1-x86_64.pkg.tar.zst"
+
+      # ── 4) AppImage(x86_64)────────────────────────────────────────────
+      - name: Build AppImage
+        run: |
+          curl -fsSL -o /tmp/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x /tmp/appimagetool
+
+          APPDIR=AppDir
+          mkdir -p "$APPDIR"
+          # 二进制与 web-ui/ 必须同层(rootDir 探测),直接平铺在 AppDir 根
+          cp -r payload/rikkahub-pc/. "$APPDIR/"
+          cp payload/meta/rikkahub-desktop.desktop "$APPDIR/"
+          cp payload/meta/icons/rikkahub-desktop-256.png "$APPDIR/rikkahub-desktop.png"
+          install -m755 payload/meta/apprun.sh "$APPDIR/AppRun"
+
+          # runner 无 FUSE,用 extract-and-run 模式
+          ARCH=x86_64 /tmp/appimagetool --appimage-extract-and-run \
+            "$APPDIR" "rikkahub-desktop-${V}-x86_64.AppImage"
+          ls -lh "rikkahub-desktop-${V}-x86_64.AppImage"
+
+      # ── 5) 源码包(git archive,仅含被跟踪文件)─────────────────────────
+      - name: Source package
+        run: |
+          git archive --format=tar.gz --prefix="rikkahub-desktop-${V}/" \
+            -o "rikkahub-desktop-${V}.tar.gz" HEAD
+          tar tzf "rikkahub-desktop-${V}.tar.gz" | head
+          ls -lh "rikkahub-desktop-${V}.tar.gz"
+
+      # ── 6) NixOS 二进制包 rikkahub-desktop-bin ─────────────────────────
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Build rikkahub-desktop-bin & export closure
+        run: |
+          nix-build --show-trace -E "
+            let pkgs = import <nixpkgs> {};
+            in pkgs.callPackage ${GITHUB_WORKSPACE}/nix/rikkahub-desktop-bin.nix {
+              version = \"${V}\";
+              src = ${GITHUB_WORKSPACE}/Rikkahub_${V}_linux_x64.tar.gz;
+            }"
+          STORE_PATH="$(readlink -f ./result)"
+          echo "Nix store path: $STORE_PATH"
+
+          # closure 导出 = 可离线 import 的二进制包
+          nix-store --export $(nix-store -qR "$STORE_PATH") > /tmp/closure.tar
+          zstd -19 -T0 /tmp/closure.tar -o "rikkahub-desktop-bin-${V}-nix-closure.tar.zst"
+
+          mkdir -p nix-artifact
+          cp "rikkahub-desktop-bin-${V}-nix-closure.tar.zst" nix-artifact/
+          cp nix/rikkahub-desktop-bin.nix nix-artifact/
+          {
+            echo "# rikkahub-desktop-bin ${V} — NixOS 二进制包"
+            echo ""
+            echo "Store path: \`${STORE_PATH}\`"
+            echo ""
+            echo "## 安装(x86_64-linux,任意 Nix/NixOS 机器)"
+            echo ""
+            echo "\`\`\`bash"
+            echo "# 多用户安装(需要 sudo);单用户安装去掉 sudo"
+            echo "zstd -d -c rikkahub-desktop-bin-${V}-nix-closure.tar.zst | sudo nix-store --import"
+            echo ""
+            echo "# 装入用户环境"
+            echo "nix-env -i ${STORE_PATH}"
+            echo "# 或 nix profile install ${STORE_PATH}"
+            echo "\`\`\`"
+            echo ""
+            echo "之后运行 \`rikkahub-desktop\`。数据目录默认 ~/.local/share/rikkahub-desktop"
+            echo "(RIKKAHUB_PC_DATA_DIR 可覆盖)。"
+            echo ""
+            echo "附带的 \`rikkahub-desktop-bin.nix\` 也可从 Release 资产 URL 直接构建:"
+            echo ""
+            echo "\`\`\`bash"
+            echo "nix-build -E '(import <nixpkgs> {}).callPackage ./rikkahub-desktop-bin.nix {"
+            echo "  version = \"${V}\"; sha256 = \"<sha256 of Rikkahub_${V}_linux_x64.tar.gz>\"; }'"
+            echo "\`\`\`"
+          } > nix-artifact/README.md
+
+      # ── 上传全部产物 ───────────────────────────────────────────────────
+      - name: Upload portable tar.gz
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rikkahub_${{ env.V }}_linux_x64.tar.gz
+          path: Rikkahub_${{ env.V }}_linux_x64.tar.gz
+          retention-days: 30
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v7
+        with:
+          name: rikkahub-desktop_${{ env.V }}_amd64.deb
+          path: rikkahub-desktop_${{ env.V }}_amd64.deb
+          retention-days: 30
+
+      - name: Upload Arch package
+        uses: actions/upload-artifact@v7
+        with:
+          name: rikkahub-desktop-${{ env.V }}-1-x86_64.pkg.tar.zst
+          path: rikkahub-desktop-${{ env.V }}-1-x86_64.pkg.tar.zst
+          retention-days: 30
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v7
+        with:
+          name: rikkahub-desktop-${{ env.V }}-x86_64.AppImage
+          path: rikkahub-desktop-${{ env.V }}-x86_64.AppImage
+          retention-days: 30
+
+      - name: Upload source package
+        uses: actions/upload-artifact@v7
+        with:
+          name: rikkahub-desktop-${{ env.V }}.tar.gz
+          path: rikkahub-desktop-${{ env.V }}.tar.gz
+          retention-days: 30
+
+      - name: Upload NixOS binary package
+        uses: actions/upload-artifact@v7
+        with:
+          name: rikkahub-desktop-bin-${{ env.V }}-nix
+          path: nix-artifact
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "### 打包产物 (v${V})" >> "$GITHUB_STEP_SUMMARY"
+          ls -lh \
+            "Rikkahub_${V}_linux_x64.tar.gz" \
+            "rikkahub-desktop_${V}_amd64.deb" \
+            "rikkahub-desktop-${V}-1-x86_64.pkg.tar.zst" \
+            "rikkahub-desktop-${V}-x86_64.AppImage" \
+            "rikkahub-desktop-${V}.tar.gz" \
+            "rikkahub-desktop-bin-${V}-nix-closure.tar.zst" >> "$GITHUB_STEP_SUMMARY"
