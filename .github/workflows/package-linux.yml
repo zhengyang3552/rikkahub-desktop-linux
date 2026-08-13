@@ -32,6 +32,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write # 流程末尾删除中转 artifact(linux-payload)需要
 
 env:
   # 与 build-linux.yml / ci.yml 保持一致;升级 Bun 时同步改
@@ -358,3 +359,19 @@ jobs:
             "rikkahub-desktop-${V}-x86_64.AppImage" \
             "rikkahub-desktop-${V}.tar.gz" \
             "rikkahub-desktop-bin-${V}-nix-closure.tar.zst" >> "$GITHUB_STEP_SUMMARY"
+
+      # linux-payload 只是 build→package 两个 job 之间的编译中转件,不是交付产物,
+      # 全部产物上传成功后删除,避免混进产物列表(失败时保留便于排查)
+      - name: Remove intermediate payload artifact
+        run: |
+          ART_ID="$(curl -s -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=linux-payload&per_page=1" \
+            | python3 -c "import json,sys; a=json.load(sys.stdin).get('artifacts',[]); print(a[0]['id'] if a else '')")"
+          if [ -n "$ART_ID" ]; then
+            curl -s -o /dev/null -w "delete linux-payload(#${ART_ID}): %{http_code}\n" -X DELETE \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${ART_ID}"
+          else
+            echo "no linux-payload artifact found"
+          fi
