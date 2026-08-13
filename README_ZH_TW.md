@@ -13,34 +13,54 @@
 
 ## 🚀 下載
 
-到 [Releases](https://github.com/yuh-G/rikkahub-desktop/releases) 頁面下載最新的安裝包，
-雙擊 `Rikkahub_X.X.X_x64-setup.exe`。安裝精靈會讓你選擇：
+Linux 安裝包由 CI 基於同步的上游原始碼自動建置，發佈在本倉庫的
+[Releases](https://github.com/zhengyang3552/rikkahub-desktop-Linux/releases) 頁面（x86_64）：
 
-- 程式安裝路徑（預設 `%LOCALAPPDATA%\Rikkahub\`，**不需要管理員權限**）
-- 資料儲存目錄——對話、設定、上傳檔案（預設 `<安裝目錄>\pc-data\`，安裝完成後也可以在應用內
-  「設定 → 資料設定」隨時更換位置）
-- 內建 WebView2 引導器：Win10 1809+ / Win11 即使未安裝 WebView2 也能執行
+* Debian / Ubuntu / Mint：rikkahub-desktop_X.X.X_amd64.deb
 
-解除安裝從 Windows「應用程式與功能」進行。`pc-data/` 的內容屬於你，需要請自行備份。
+  ```
+  sudo dpkg -i rikkahub-desktop_X.X.X_amd64.deb
+  ```
+* Arch / Manjaro：rikkahub-desktop-X.X.X-1-x86_64.pkg.tar.zst
+
+  ```
+  sudo pacman -U rikkahub-desktop-X.X.X-1-x86_64.pkg.tar.zst
+  ```
+* AppImage（任意發行版）：rikkahub-desktop-X.X.X-x86_64.AppImage
+
+  ```
+  chmod +x rikkahub-desktop-X.X.X-x86_64.AppImage
+  ./rikkahub-desktop-X.X.X-x86_64.AppImage
+  ```
+* 便攜版：Rikkahub_X.X.X_linux_x64.tar.gz
+
+  ```
+  tar -xzf Rikkahub_X.X.X_linux_x64.tar.gz
+  ./rikkahub-pc/rikkahub-pc
+  ```
+* NixOS：rikkahub-desktop-bin-X.X.X-nix（Nix closure + derivation，見包內 README）
+* 原始碼包：rikkahub-desktop-X.X.X.tar.gz（從原始碼建置）
+
+啟動後 UI 服務於 http://localhost:8080，並自動以預設瀏覽器開啟。
+資料（對話、設定、上傳檔案）預設存放在 `~/.local/share/rikkahub-desktop`，
+可用環境變數 `RIKKAHUB_PC_DATA_DIR` 覆蓋。
 
 無遙測、不需要管理員權限、不需要雲端帳號，**一切都在本機完成**。
 
-不想用安裝包？每個版本同時提供**便攜版 .zip**——解壓即用，無需安裝。
-
-> **使用 Linux？** 每個版本都提供便攜版 `.tar.gz`（二進位檔 + 前端，解壓即用）。想用發行版原生套件，
-> 或從原始碼建置 / 執行 Docker？詳見下方 [社群打包](#-社群打包)、[Linux 二進位檔](#-linux-二進位檔) 與 [Docker](#docker)。
+> **用 Windows？** Windows 安裝包與便攜版 `.zip` 請到上游
+> [yuh-G/rikkahub-desktop Releases](https://github.com/yuh-G/rikkahub-desktop/releases) 下載。
 
 ## 📦 社群打包
 
-除了官方的 `tar.gz`，社群還為幾個 Linux 發行版維護了原生套件。**這些套件由各自的作者維護，並非本專案官方維護**，
-可能滯後於最新版本——打包相關問題請向上游維護者回報。
+原生套件現已由本倉庫 CI 官方建置（見上方 [下載](#-下載)）。社群另外維護了替代安裝渠道——
+**這些渠道由各自作者維護，並非本專案官方維護**：
 
 | 發行版 | 安裝方式 | 維護者 |
 |---|---|---|
-| Debian / Ubuntu / Mint | 從 [Releases](https://github.com/yuh-G/rikkahub-desktop/releases) 頁或[網盤](https://1842911757.share.123pan.cn/123pan/oW0UTd-irzxh)下載 `.deb` → `sudo apt install ./rikkahub-pc_*_amd64.deb` | [@Noah0932](https://github.com/Noah0932) |
-| Arch / Manjaro | 從 [Releases](https://github.com/yuh-G/rikkahub-desktop/releases) 頁[網盤](https://1842911757.share.123pan.cn/123pan/oW0UTd-irzxh)下載 `.pkg.tar.zst` → `sudo pacman -U rikkahub-pc-*-x86_64.pkg.tar.zst` | [@Noah0932](https://github.com/Noah0932) |
-| NixOS / Nix | `nur.repos.af-nur.rikkahub-desktop`(從原始碼建置的版本，建議使用二進位快取 `af-nur.cachix.org`)<br/>`nur.repos.af-nur.rikkahub-desktop-bin`(同步 [Releases](https://github.com/yuh-G/rikkahub-desktop/releases) 中的二進位建置) | [@AstralFlare-owo](https://github.com/AstralFlare-owo) |
-感謝兩位補上了這些發行版的空缺。
+| NixOS / Nix | `nur.repos.af-nur.rikkahub-desktop`（從原始碼建置，建議使用二進位快取 `af-nur.cachix.org`） | [@AstralFlare-owo](https://github.com/AstralFlare-owo) |
+
+此前由 [@Noah0932](https://github.com/Noah0932) 手工建置的 `.deb` / `.pkg.tar.zst`
+已由上方 CI 建置的資產接替。感謝兩位補上了這些發行版的空缺。
 
 ## ✨ 功能特色
 

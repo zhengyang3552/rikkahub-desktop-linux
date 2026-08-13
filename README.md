@@ -15,40 +15,56 @@
 
 ## 🚀 Download
 
-Grab the latest installer from the
-[Releases](https://github.com/yuh-G/rikkahub-desktop/releases) page and double-click
-`Rikkahub_X.X.X_x64-setup.exe`. The wizard:
+Linux packages are built by CI straight from the synced upstream source and published on
+this repo's [Releases](https://github.com/zhengyang3552/rikkahub-desktop-Linux/releases)
+page (x86_64):
 
-- Asks where to install the program (default: `%LOCALAPPDATA%\Rikkahub\`,
-  **no admin rights required**)
-- Asks where to keep your data — conversations, settings, uploaded files (default:
-  `<install dir>\pc-data\`; freely movable later from the in-app settings)
-- Ships a WebView2 bootstrapper so the app works on any Win10 1809+ / Win11 machine,
-  even without WebView2 pre-installed
+* Debian / Ubuntu / Mint: rikkahub-desktop_X.X.X_amd64.deb
 
-Uninstall via Windows "Apps & features". `pc-data/` is yours — back it up if you care.
+  ```
+  sudo dpkg -i rikkahub-desktop_X.X.X_amd64.deb
+  ```
+* Arch / Manjaro: rikkahub-desktop-X.X.X-1-x86_64.pkg.tar.zst
+
+  ```
+  sudo pacman -U rikkahub-desktop-X.X.X-1-x86_64.pkg.tar.zst
+  ```
+* AppImage (any distro): rikkahub-desktop-X.X.X-x86_64.AppImage
+
+  ```
+  chmod +x rikkahub-desktop-X.X.X-x86_64.AppImage
+  ./rikkahub-desktop-X.X.X-x86_64.AppImage
+  ```
+* Portable: Rikkahub_X.X.X_linux_x64.tar.gz
+
+  ```
+  tar -xzf Rikkahub_X.X.X_linux_x64.tar.gz
+  ./rikkahub-pc/rikkahub-pc
+  ```
+* NixOS: rikkahub-desktop-bin-X.X.X-nix (Nix closure + derivation, see README inside)
+* Source: rikkahub-desktop-X.X.X.tar.gz (build from source)
+
+After launch the UI is served at http://localhost:8080 and opens in your default browser.
+Data (conversations, settings, uploaded files) lives in
+`~/.local/share/rikkahub-desktop` by default — override with `RIKKAHUB_PC_DATA_DIR`.
 
 No telemetry, no admin, no cloud account required. Everything is local.
 
-Prefer no installer? Each release also ships a portable **.zip** — unzip and run, nothing
-else needed.
-
-> **On Linux?** Each release ships a portable `.tar.gz` (binary + frontend, unzip and run).
-> Prefer a native distro package, or building from source / running Docker? See
-> [Community packages](#-community-packages), [Linux binary](#linux-binary) and [Docker](#docker) below.
+> **On Windows?** The Windows installer and portable `.zip` ship from the upstream
+> [yuh-G/rikkahub-desktop Releases](https://github.com/yuh-G/rikkahub-desktop/releases).
 
 ## 📦 Community packages
 
-Beyond the official `tar.gz`, the community maintains native packages for several Linux
-distributions. **These are maintained by their respective authors, not this project**, and may
-lag behind the latest release — for packaging issues please report upstream to the maintainer.
+Native packages are now built officially by this repo's CI (see
+[Download](#-download) above). The community additionally maintains alternative install
+channels — **these are maintained by their respective authors, not this project**:
 
 | Distribution | How to install | Maintainer |
 |---|---|---|
-| Debian / Ubuntu / Mint | `.deb` from the [Releases](https://github.com/yuh-G/rikkahub-desktop/releases) page or [Cloud drive](https://1842911757.share.123pan.cn/123pan/oW0UTd-irzxh) → `sudo apt install ./rikkahub-pc_*_amd64.deb` | [@Noah0932](https://github.com/Noah0932) |
-| Arch / Manjaro | `.pkg.tar.zst` from the [Releases](https://github.com/yuh-G/rikkahub-desktop/releases) page or [Cloud drive](https://1842911757.share.123pan.cn/123pan/oW0UTd-irzxh) → `sudo pacman -U rikkahub-pc-*-x86_64.pkg.tar.zst` | [@Noah0932](https://github.com/Noah0932) |
-| NixOS / Nix | `nur.repos.af-nur.rikkahub-desktop` (Built from source, recommended to use the binary cache `af-nur.cachix.org`)<br/>`nur.repos.af-nur.rikkahub-desktop-bin` (Synchronized with binary builds from [Releases](https://github.com/yuh-G/rikkahub-desktop/releases)) | [@AstralFlare-owo](https://github.com/AstralFlare-owo) |
+| NixOS / Nix | `nur.repos.af-nur.rikkahub-desktop` (built from source, binary cache `af-nur.cachix.org` recommended) | [@AstralFlare-owo](https://github.com/AstralFlare-owo) |
 
+The `.deb` / `.pkg.tar.zst` packages previously hand-built by
+[@Noah0932](https://github.com/Noah0932) are superseded by the CI-built assets above.
 Many thanks to both for covering these distributions.
 
 ## ✨ Features
