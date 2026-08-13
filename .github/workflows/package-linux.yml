@@ -134,11 +134,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # upload 时以 payload/ 内容为 artifact 根,下载到 payload/ 目录还原布局
       - name: Download payload
         uses: actions/download-artifact@v7
         with:
           name: linux-payload
-          path: .
+          path: payload
 
       - name: Install packaging tools
         run: |
