@@ -452,17 +452,42 @@ jobs:
           done
           ls -lh files
 
-      - name: Attach to Release (说明一字不动)
+      # gh release upload 按 tag 查不到 draft Release,改走 API:
+      # 列表接口能拿到 draft,用其 upload_url 直传资产
+      - name: Attach to Release (含 draft,说明一字不动)
         run: |
           V="${{ steps.t.outputs.version }}"
           TAG="${{ steps.t.outputs.tag }}"
-          gh release upload "$TAG" \
-            "files/Rikkahub_${V}_linux_x64.tar.gz" \
-            "files/rikkahub-desktop_${V}_amd64.deb" \
-            "files/rikkahub-desktop-${V}-1-x86_64.pkg.tar.zst" \
-            "files/rikkahub-desktop-${V}-x86_64.AppImage" \
-            "files/rikkahub-desktop-${V}.tar.gz" \
-            "files/rikkahub-desktop-bin-${V}-nix-closure.tar.zst" \
-            "files/rikkahub-desktop-bin.nix" \
-            --clobber -R "$REPO"
+          REL="$(gh api "repos/$REPO/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | {id, upload_url, draft} | @json" | head -n1)"
+          if [ -z "$REL" ]; then
+            echo "::error::找不到 Release ${TAG}"
+            exit 1
+          fi
+          REL_ID="$(echo "$REL" | jq -r .id)"
+          UPLOAD_URL="$(echo "$REL" | jq -r .upload_url | sed 's/{?name,label}//')"
+          echo "release #${REL_ID} draft=$(echo "$REL" | jq -r .draft)"
+
+          FILES=(
+            "files/Rikkahub_${V}_linux_x64.tar.gz"
+            "files/rikkahub-desktop_${V}_amd64.deb"
+            "files/rikkahub-desktop-${V}-1-x86_64.pkg.tar.zst"
+            "files/rikkahub-desktop-${V}-x86_64.AppImage"
+            "files/rikkahub-desktop-${V}.tar.gz"
+            "files/rikkahub-desktop-bin-${V}-nix-closure.tar.zst"
+            "files/rikkahub-desktop-bin.nix"
+          )
+          for f in "${FILES[@]}"; do
+            name="$(basename "$f")"
+            # clobber:先删同名旧资产
+            OLD_ID="$(gh api "repos/$REPO/releases/$REL_ID/assets" \
+              --jq ".[] | select(.name == \"$name\") | .id" | head -n1)"
+            if [ -n "$OLD_ID" ]; then
+              gh api -X DELETE "repos/$REPO/releases/$REL_ID/assets/$OLD_ID"
+            fi
+            curl -s -o /dev/null -w "upload ${name}: %{http_code}\n" -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              "${UPLOAD_URL}?name=${name}" --data-binary @"$f"
+          done
           echo "attached to release ${TAG}"
