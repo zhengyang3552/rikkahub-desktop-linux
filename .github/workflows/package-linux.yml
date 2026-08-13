@@ -90,6 +90,12 @@ jobs:
           chmod +x ../dist/rikkahub-pc
           test -x ../dist/rikkahub-pc
 
+      # ubuntu-24.04 runner 不再预装 ImageMagick,图标缩放需要显式安装
+      - name: Install ImageMagick
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq imagemagick >/dev/null
+
       - name: Assemble payload
         run: |
           mkdir -p payload/rikkahub-pc/web-ui/build payload/meta/icons
