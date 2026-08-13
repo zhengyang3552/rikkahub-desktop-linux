@@ -8,8 +8,9 @@ name: Build Linux Binary
 # 后端 update/check 按 *_linux_x64.tar.gz 命名约定匹配这个 asset,文件名不能改。
 #
 # 两种触发:
-#   - tag 推送(v*.*.*):打包并自动附加到对应版本的 Release
 #   - 手动触发(workflow_dispatch):只产出 artifact,从 Actions 页下载后手动上传到 Release
+#   - tag 推送的构建+Release 发布已归口到 package-linux.yml(避免两个工作流抢建 Release),
+#     本工作流不再监听 tag;下方的 Attach 步骤保留,若将来恢复 tag 触发仍可用。
 on:
   workflow_dispatch:
     inputs:
@@ -17,8 +18,6 @@ on:
         description: '版本号(用于产物文件名,例如 1.1.0)'
         required: true
         default: '1.1.0'
-  push:
-    tags: ['v*.*.*']
 
 permissions:
   contents: write # tag 触发时附加资产到 Release 需要
