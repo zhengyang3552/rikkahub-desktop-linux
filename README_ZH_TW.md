@@ -41,7 +41,7 @@ Linux 安裝包由 CI 基於同步的上游原始碼自動建置，發佈在本�
 * NixOS：rikkahub-desktop-bin-X.X.X-nix（Nix closure + derivation，見包內 README）
 * 原始碼包：rikkahub-desktop-X.X.X.tar.gz（從原始碼建置）
 
-啟動後 UI 服務於 http://localhost:8080，並自動以預設瀏覽器開啟。
+啟動後 UI 服務於 http://localhost:8080 ，並自動以預設瀏覽器開啟。
 資料（對話、設定、上傳檔案）預設存放在 `~/.local/share/rikkahub-desktop`，
 可用環境變數 `RIKKAHUB_PC_DATA_DIR` 覆蓋。
 
