@@ -24,23 +24,27 @@ page (x86_64):
   ```
   sudo dpkg -i rikkahub-desktop_X.X.X_amd64.deb
   ```
+
 * Arch / Manjaro: rikkahub-desktop-X.X.X-1-x86_64.pkg.tar.zst
 
   ```
   sudo pacman -U rikkahub-desktop-X.X.X-1-x86_64.pkg.tar.zst
   ```
+  
 * AppImage (any distro): rikkahub-desktop-X.X.X-x86_64.AppImage
 
   ```
   chmod +x rikkahub-desktop-X.X.X-x86_64.AppImage
   ./rikkahub-desktop-X.X.X-x86_64.AppImage
   ```
+  
 * Portable: Rikkahub_X.X.X_linux_x64.tar.gz
 
   ```
   tar -xzf Rikkahub_X.X.X_linux_x64.tar.gz
   ./rikkahub-pc/rikkahub-pc
   ```
+  
 * NixOS: rikkahub-desktop-bin-X.X.X-nix (Nix closure + derivation, see README inside)
 * Source: rikkahub-desktop-X.X.X.tar.gz (build from source)
 
