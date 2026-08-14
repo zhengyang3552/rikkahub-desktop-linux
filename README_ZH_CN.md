@@ -41,7 +41,7 @@ Linux 安装包由 CI 基于同步的上游源码自动构建，发布在本仓�
 * NixOS：rikkahub-desktop-bin-X.X.X-nix（Nix closure + derivation，见包内 README）
 * 源码包：rikkahub-desktop-X.X.X.tar.gz（从源码构建）
 
-启动后 UI 服务于 http://localhost:8080，并自动用默认浏览器打开。
+启动后 UI 服务于 http://localhost:8080 ，并自动用默认浏览器打开。
 数据（会话、设置、上传文件）默认存放在 `~/.local/share/rikkahub-desktop`，
 可用环境变量 `RIKKAHUB_PC_DATA_DIR` 覆盖。
 
