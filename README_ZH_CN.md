@@ -14,7 +14,19 @@
 ## 🚀 下载
 
 Linux 安装包由 CI 基于同步的上游源码自动构建，发布在本仓库的
-[Releases](https://github.com/zhengyang3552/rikkahub-desktop-Linux/releases) 页面（x86_64）：
+[Releases](https://github.com/zhengyang3552/rikkahub-desktop-Linux/releases) 页面（x86_64）。
+
+**Debian / Ubuntu / Mint 用户推荐使用 apt 源**，一次配置，之后常规 `apt upgrade` 自动拿新版：
+
+```bash
+curl -fsSL https://zhengyang3552.github.io/rikkahub-desktop-linux/key.gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/rikkahub-desktop.gpg
+echo "deb [signed-by=/usr/share/keyrings/rikkahub-desktop.gpg] https://zhengyang3552.github.io/rikkahub-desktop-linux/ ./" \
+  | sudo tee /etc/apt/sources.list.d/rikkahub-desktop.list
+sudo apt update && sudo apt install rikkahub-desktop
+```
+
+也可以直接下载单个安装包手动安装：
 
 * Debian / Ubuntu / Mint：rikkahub-desktop_X.X.X_amd64.deb
 

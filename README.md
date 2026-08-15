@@ -17,7 +17,20 @@
 
 Linux packages are built by CI straight from the synced upstream source and published on
 this repo's [Releases](https://github.com/zhengyang3552/rikkahub-desktop-Linux/releases)
-page (x86_64):
+page (x86_64).
+
+**Debian / Ubuntu / Mint users should prefer the apt repository** — set it up once and
+regular `apt upgrade` will pick up new versions automatically:
+
+```bash
+curl -fsSL https://zhengyang3552.github.io/rikkahub-desktop-linux/key.gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/rikkahub-desktop.gpg
+echo "deb [signed-by=/usr/share/keyrings/rikkahub-desktop.gpg] https://zhengyang3552.github.io/rikkahub-desktop-linux/ ./" \
+  | sudo tee /etc/apt/sources.list.d/rikkahub-desktop.list
+sudo apt update && sudo apt install rikkahub-desktop
+```
+
+Or download individual packages for manual install:
 
 * Debian / Ubuntu / Mint: rikkahub-desktop_X.X.X_amd64.deb
 
