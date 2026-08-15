@@ -128,11 +128,18 @@ jobs:
           done
           echo "${{ steps.ver.outputs.version }}" > payload/version.txt
 
+      # upload-artifact 走 zip 不保留权限位(文件全被压成 644),rikkahub-pc 的 +x
+      # 会在 build→package 中转时丢失,导致 deb 装完二进制不可执行。
+      # 修复:先把 payload/ 打成 tar 再上传——tar 保留权限位,
+      # package job 下载后解包即可,任何权限都原样传递。
+      - name: Tar payload (preserve exec bits)
+        run: tar -czf payload.tar.gz -C payload .
+
       - name: Upload payload
         uses: actions/upload-artifact@v7
         with:
           name: linux-payload
-          path: payload
+          path: payload.tar.gz
           retention-days: 7
 
   package:
@@ -146,12 +153,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # upload 时以 payload/ 内容为 artifact 根,下载到 payload/ 目录还原布局
+      # build job 传上来的是 payload.tar.gz(zip 中转不保留权限位,tar 保留):
+      # 下载后解包,任何权限都原样传递
       - name: Download payload
         uses: actions/download-artifact@v7
         with:
           name: linux-payload
-          path: payload
+          path: linux-payload
+
+      - name: Extract payload
+        run: mkdir payload && tar -xzf linux-payload/payload.tar.gz -C payload
 
       - name: Install packaging tools
         run: |
