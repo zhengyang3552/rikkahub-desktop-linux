@@ -1,0 +1,19 @@
+Package: rikkahub-desktop
+Version: 1.5.0
+Section: net
+Priority: optional
+Architecture: amd64
+Maintainer: zhengyang3552 <zhengyang3552@users.noreply.github.com>
+Installed-Size: 153184
+Homepage: https://github.com/zhengyang3552/rikkahub-desktop-Linux
+Description: Rikkahub desktop LLM chat client for Linux
+ Native LLM client with multi-provider support (OpenAI / Anthropic /
+ Gemini / OpenAI-compatible endpoints), MCP tools, web search, image
+ generation and local model support (Ollama / LM Studio / llama.cpp).
+ Runs a local server at http://localhost:8080 and opens the UI in
+ your default browser. Data is stored in
+ ~/.local/share/rikkahub-desktop (override: RIKKAHUB_PC_DATA_DIR).
+Filename: pool/rikkahub-desktop_1.5.0_amd64.deb
+Size: 53029804
+SHA256: a62b8724f6c7fc28253f3bf4018b5d1431200b0daaa4f5ce3951778372f4d7bc
+

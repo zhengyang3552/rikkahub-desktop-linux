@@ -1,0 +1,16 @@
+Date: Wed, 19 Aug 2026 11:00:48 +0000
+Description: rikkahub-desktop Linux packages
+Label: rikkahub-desktop
+Origin: rikkahub-desktop
+MD5Sum:
+ d6a8d3f9425d59412c6f92b7316dff7d              824 Packages
+ b54ef4d43afd0bb6eb0aa88490506157              557 Packages.gz
+SHA1:
+ 6dfaa987b267b5c59a46de538e3a8a9ae12049f7              824 Packages
+ 2c3e9212cc96c32407ecfd351979cbed24d6b076              557 Packages.gz
+SHA256:
+ d18e2d1e4c2684fe0595a38505a6fad9f3bee32ee1661a443b57d19ef4ad4f90              824 Packages
+ 8f6beb607dcb367c1f1c070fd2163a672293b5f71c71c7119e23440679f4919e              557 Packages.gz
+SHA512:
+ f3acf82b003dfa6dd5694becafeba370f7d1fd1ed143c80289cbf901b25eed2088f16e34aa50e1f8dc023c743dc05d1e730519d47829d13065539a4ac0dbcbf2              824 Packages
+ 0d9bc0f750ee945fae60125c6efbd5b0dbd5943d3ba7dbac2d485365a5f35bae15907a66b52ead387a3f97f5d46709f2fedc843c74e89308ace4850479c416a7              557 Packages.gz

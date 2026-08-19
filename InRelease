@@ -1,0 +1,35 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Date: Wed, 19 Aug 2026 11:00:48 +0000
+Description: rikkahub-desktop Linux packages
+Label: rikkahub-desktop
+Origin: rikkahub-desktop
+MD5Sum:
+ d6a8d3f9425d59412c6f92b7316dff7d              824 Packages
+ b54ef4d43afd0bb6eb0aa88490506157              557 Packages.gz
+SHA1:
+ 6dfaa987b267b5c59a46de538e3a8a9ae12049f7              824 Packages
+ 2c3e9212cc96c32407ecfd351979cbed24d6b076              557 Packages.gz
+SHA256:
+ d18e2d1e4c2684fe0595a38505a6fad9f3bee32ee1661a443b57d19ef4ad4f90              824 Packages
+ 8f6beb607dcb367c1f1c070fd2163a672293b5f71c71c7119e23440679f4919e              557 Packages.gz
+SHA512:
+ f3acf82b003dfa6dd5694becafeba370f7d1fd1ed143c80289cbf901b25eed2088f16e34aa50e1f8dc023c743dc05d1e730519d47829d13065539a4ac0dbcbf2              824 Packages
+ 0d9bc0f750ee945fae60125c6efbd5b0dbd5943d3ba7dbac2d485365a5f35bae15907a66b52ead387a3f97f5d46709f2fedc843c74e89308ace4850479c416a7              557 Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAdFiEE6yVXJr8m8TGe6n12/w8dJT2aCwcFAmqFjOEACgkQ/w8dJT2a
+CwfjUA/8CDMkXq0lpVYgkxzJiKFbwyWJoFvId0I+9TqGD/JKYkGIf1+vx7G14YEG
+oZrZtzr8LELy17PHAVKTZlkSG2U5MqEVegH3N/gpcIi1ojfKDY6W/Mldo9SDQqc/
+Qp+KcgXKvxpZ1ldvY6CvbPxkXxaAhHrI5+EMnUnojFw/s/k2mYOViOQ/RX68xWwQ
+xyLZviPDpxiSXFsOQNZQXI55YSZ/d10uXfVOXDleez9cpK9KOuFxY7byC8xtjjFi
+vslxPnWNq8A2E7PI9b4NRzDB550WrzOrKcPo3ZPI9xROLBzIyl/GwedwWEYRISGf
+8L25blLrRWrhZME1CMpJzpaB2/Ee725KbPocfOHEsE+oL326WSIlIG2k6cqJsndK
+r8pUjLL1AwG3mnKvq0R+tpfMhV7SDaliahZ6aFp4UePB8cW7/+2/7WBigHViBDoT
+yz9z5kHPL2bg3rb4UmXII+0qpG+SWFCXpcy1f7BTs5gnXQHHjyA1PAH0Y6zajkNT
+JuE8R9GtVoP4Tv53L0rOvY+xpnDYc4cUIIeR1Q16klo64wM6WWaCUForNIZeNiP/
+cOtyxAfL42RnvOGaRVByJ9IrqdndO//4f2UfyQseFw9paG73m8vt8vY1zw10Xmdf
+lSuDqKH6XhFuCG0uvVOyhnoC0wTZzaXoYUhlBledRYzvqNj+bgk=
+=He8O
+-----END PGP SIGNATURE-----

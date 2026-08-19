@@ -2,8 +2,9 @@ name: Package Linux
 
 # 仓库从上游同步(push 到 main)后自动编译并打包全部 Linux 发行版格式;也可手动触发。
 # 发布:网页上创建 Release(写说明)时,自动把最近一次成功构建的产物原样挂上,不重新编译。
-# apt 源:正式 Release 挂完资产后,更新 apt 分支的源(pool/*.deb + 索引,Pages 托管),
-#        Filename 用相对路径兼容所有 apt 版本;用户 apt upgrade 自动拿新版。
+# apt 源:正式 Release 挂完资产后,更新 Pages 托管的 apt 仓库(deb 拷入 pool/ + 重建索引),
+#        Filename 写相对路径,deb 随 Pages 一起托管(apt 不支持绝对 URL Filename);
+#        用户 apt upgrade 自动拿新版。
 #
 # 产物(均为 amd64 / x86_64):
 #   - Rikkahub_<ver>_linux_x64.tar.gz                便携 tar.gz(应用内更新按 *_linux_x64.tar.gz 匹配,文件名勿改)
@@ -505,9 +506,10 @@ jobs:
           done
           echo "attached to release ${TAG}"
 
-  # ── 正式 Release 发布后:更新 apt 源(apt 分支,Pages 托管),用户 apt upgrade 升级 ─────
-  # apt 分支存 pool/*.deb + flat 索引;Filename 相对路径,兼容所有 apt 版本。
-  # 脚本本体从 main 用 git show 取(单一事实源);draft Release 资产匿名不可下载,跳过。
+  # ── 正式 Release 发布后:更新 apt 源,用户可通过 apt upgrade 升级 ─────────
+  # deb 拷入仓库 pool/、索引(Packages/Release/InRelease)重建,一起提交到 main 由 Pages 托管;
+  # apt 按 "Pages base URL + 相对 Filename" 下载,deb 必须入库(apt 不认绝对 URL Filename)。
+  # draft Release 的资产匿名不可下载,跳过。
   apt:
     name: Update apt repository
     needs: publish
@@ -541,17 +543,17 @@ jobs:
             echo "::notice::draft Release 的资产匿名不可下载,跳过 apt 源更新"
           fi
 
-      - name: Checkout apt branch
+      - name: Checkout main
         if: steps.draft.outputs.draft == 'false'
         uses: actions/checkout@v5
         with:
-          ref: apt
+          ref: main
 
       - name: Install apt repo tools
         if: steps.draft.outputs.draft == 'false'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq apt-utils dpkg-dev >/dev/null
+          sudo apt-get install -y -qq apt-utils >/dev/null
 
       - name: Download deb from Release
         if: steps.draft.outputs.draft == 'false'
@@ -567,21 +569,21 @@ jobs:
       - name: Update apt index
         if: steps.draft.outputs.draft == 'false'
         run: |
-          # 脚本从 main 取,避免 apt 分支上的副本过期
-          git fetch --depth 1 origin main
-          git show FETCH_HEAD:ci/apt/update-apt-repo.sh > /tmp/update-apt-repo.sh
-          bash /tmp/update-apt-repo.sh "files/rikkahub-desktop_${{ steps.t.outputs.version }}_amd64.deb"
+          bash ci/apt/update-apt-repo.sh \
+            "files/rikkahub-desktop_${{ steps.t.outputs.version }}_amd64.deb"
 
-      # 用默认 GITHUB_TOKEN 推 apt 分支不会再次触发工作流,不会死循环
-      - name: Commit & push apt branch (Pages)
+      # 用默认 GITHUB_TOKEN 推 main 会再次触发工作流,不会死循环
+      - name: Commit & push index (Pages)
         if: steps.draft.outputs.draft == 'false'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pool Packages Packages.gz Release Release.gpg InRelease
+          git add Packages Packages.gz Release Release.gpg InRelease pool
           if git diff --cached --quiet; then
             echo "索引无变化,跳过提交"
           else
+            # 先提交再 rebase:有暂存变更时 git pull --rebase 会直接拒绝(exit 128)
             git commit -m "apt: publish rikkahub-desktop ${{ steps.t.outputs.version }}"
+            git pull --rebase origin main
             git push
           fi

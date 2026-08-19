@@ -31,12 +31,12 @@ AppImage 为只读 squashfs,同理把数据落用户目录;`AppRun` 由
 
 ## apt 源（Debian / Ubuntu 自动升级）
 
-正式 Release 发布后，`package-linux.yml` 的 `apt` job 自动更新 `apt` 分支的源：
-`pool/` 存各版本 deb，分支根目录是 flat 索引（`Packages` / `Release` / `InRelease`），
-由 GitHub Pages 托管。`Packages` 的 `Filename` 为相对路径 `pool/xxx.deb`，
-兼容所有 apt 版本。索引签名用专用 GPG 密钥（私钥存 Actions Secret
-`APT_GPG_PRIVATE_KEY`，公钥为 apt 分支根目录 `key.gpg`）。
-索引生成逻辑在 `ci/apt/update-apt-repo.sh`（在 main 上，CI job 取用）。
+正式 Release 发布后，`package-linux.yml` 的 `apt` job 自动更新仓库的 apt 源：
+deb 拷入 `pool/`，仓库根目录重建 flat 索引（`Packages` / `Release` / `InRelease`），
+一起提交到 main 由 GitHub Pages 托管。`Packages` 的 `Filename` 为相对路径
+`pool/xxx.deb`（apt 不支持绝对 URL，会被拼在源地址后导致 404）。
+索引签名用专用 GPG 密钥（私钥存 Actions Secret `APT_GPG_PRIVATE_KEY`，
+公钥为根目录 `key.gpg`）。索引生成逻辑在 `ci/apt/update-apt-repo.sh`。
 
 ## 文件
 
