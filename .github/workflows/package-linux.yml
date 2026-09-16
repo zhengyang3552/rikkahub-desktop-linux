@@ -47,8 +47,8 @@ permissions:
   actions: write # 流程末尾删除中转 artifact(linux-payload)需要
 
 env:
-  # 与 build-linux.yml / ci.yml 保持一致;升级 Bun 时同步改
-  BUN_VERSION: '1.3.13'
+  # 与 build-linux.yml / ci.yml / Dockerfile 保持一致;升级 Bun 时同步改
+  BUN_VERSION: '1.4.0'
 
 jobs:
   build:
@@ -80,6 +80,24 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
+
+      # pi/ 是 gitignore 的本地浅克隆(vendored 源码),不进仓库。pc-server 的
+      # pi-engine/ 直接 import 其 TS 源码(../../pi/packages/...),缺它
+      # bun build --compile 第一步解析 import 即报 Could not resolve。
+      # 与 build-linux.yml / ci.yml / Dockerfile 相同处理:浅克隆上游基线 +
+      # 应用 pi-patches/*.patch。必须排在 Setup Bun 之后(bun install 需要 bun)。
+      # pi 的 bun.lock 是 lockfileVersion 1,Bun 1.4.0 会迁移它,故不能用 --frozen-lockfile。
+      # packages/ai/src/providers/data/.manifest.json 是构建期生成物、git 不跟踪,
+      # 由 generate-models 从 models.dev 拉取生成(需网络,CI 有)。
+      - name: Restore pi vendor
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/earendil-works/pi.git pi
+          cd pi
+          git checkout 5cd93f688aaab89dbb6dfa4aca535f21796ae185
+          git reset --hard
+          git apply ../pi-patches/*.patch
+          bun install
+          cd packages/ai && bun run generate-models
 
       # react-router build 在 SPA 模式下引用 react-dom/server,Bun 自带版本缺
       # renderToPipeableStream 会报错——换成 Node 版(与 build-linux.yml 相同处理)。
