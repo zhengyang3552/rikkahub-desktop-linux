@@ -14,6 +14,7 @@ export type {
   ConversationSnapshotEventDto,
   ConversationSnapshotMetaEventDto,
   ConversationTextDeltaEventDto,
+  EngineStatusEventDto,
   ExtractionStatusDto,
   MessageDto,
   MessageNodeDto,
@@ -21,4 +22,5 @@ export type {
   PagedResult,
   UploadedFileDto,
   UploadFilesResponseDto,
+  WorkspaceDto,
 } from "@server/foundation/types/dto";

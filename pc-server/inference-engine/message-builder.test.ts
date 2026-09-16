@@ -6,13 +6,17 @@ import { describe, expect, test } from "bun:test";
 
 import {
   apiContentFromParts,
+  appendAssistantApiMessages,
+  claudeBlocksFromUiParts,
   claudeContentFromApiContent,
   dataUrlForMessageUrl,
   documentPartsFirst,
   groupAssistantPartsByToolBoundary,
+  isModelAllowTemperature,
   parseDataUrl,
   reasoningPayloadForProvider,
   responseApiContentFromUiParts,
+  responseApiMessagesFromUiMessages,
   supportsInputModality,
 } from "./message-builder";
 import type { MessagePart, Model, Provider } from "../foundation/types";
@@ -183,6 +187,23 @@ describe("reasoningPayloadForProvider — Gemini via OpenAI 兼容层", () => {
     });
   });
 
+  test("gemini-3 档位按型号查表(对齐 pi getThinkingLevel):Pro 仅 low/high,非 Pro 全值域", () => {
+    const gemini35Flash = { modelId: "gemini-3.5-flash", abilities: ["REASONING"] } as unknown as Model;
+    const levelOf = (m: Model, level: string) =>
+      (reasoningPayloadForProvider(relay, m, level) as any).extra_body.google.thinking_config.thinking_level;
+    // Pro:minimal 收 low、medium 收 high(此前 minimal 倒挂映 high、medium 原样发出值域外)。
+    expect(levelOf(gemini3, "minimal")).toBe("low");
+    expect(levelOf(gemini3, "medium")).toBe("high");
+    expect(levelOf(gemini3, "max")).toBe("high");
+    // 非 Pro:官方全值域原样。
+    expect(levelOf(gemini35Flash, "minimal")).toBe("minimal");
+    expect(levelOf(gemini35Flash, "medium")).toBe("medium");
+    expect(levelOf(gemini35Flash, "xhigh")).toBe("high");
+    // off 思考不可关:取该型号最少档。
+    expect(levelOf(gemini3, "off")).toBe("low");
+    expect(levelOf(gemini35Flash, "off")).toBe("minimal");
+  });
+
   test("off:flash 关预算,pro 不可关(与原生路径 googleGenerationConfig 一致)", () => {
     expect(reasoningPayloadForProvider(relay, gemini25Flash, "off")).toEqual({
       extra_body: { google: { thinking_config: { include_thoughts: false, thinking_budget: 0 } } },
@@ -200,5 +221,248 @@ describe("reasoningPayloadForProvider — Gemini via OpenAI 兼容层", () => {
   test("OpenRouter 等已知 host 分支优先,不走 extra_body", () => {
     const openrouter = { type: "openai", baseUrl: "https://openrouter.ai/api/v1", apiKey: "k" } as unknown as Provider;
     expect(reasoningPayloadForProvider(openrouter, gemini25, "high")).toEqual({ reasoning: { effort: "high" } });
+  });
+});
+
+// Kimi K3 请求格式收紧(官方"思考模型/模型参数参考"文档):K3 移除 thinking 参数,改用
+// 顶层 reasoning_effort(仅 low/high/max);K2.7-code 传 disabled 报 400,一律不发;
+// K2.6 开思考需显式 keep:"all" 才保留历史思考(#1586);K2.5 起采样参数官方固定禁发。
+describe("reasoningPayloadForProvider — Moonshot Kimi 代际", () => {
+  const moonshot = { type: "openai", baseUrl: "https://api.moonshot.cn/v1", apiKey: "k" } as unknown as Provider;
+  const m = (modelId: string) => ({ modelId, abilities: ["REASONING"] }) as unknown as Model;
+
+  test("K3:不发 thinking,档位收拢为顶层 reasoning_effort(low/high/max)", () => {
+    expect(reasoningPayloadForProvider(moonshot, m("kimi-k3"), "high")).toEqual({ reasoning_effort: "high" });
+    expect(reasoningPayloadForProvider(moonshot, m("kimi-k3"), "medium")).toEqual({ reasoning_effort: "high" });
+    expect(reasoningPayloadForProvider(moonshot, m("kimi-k3"), "xhigh")).toEqual({ reasoning_effort: "max" });
+    expect(reasoningPayloadForProvider(moonshot, m("kimi-k3"), "max")).toEqual({ reasoning_effort: "max" });
+    expect(reasoningPayloadForProvider(moonshot, m("kimi-k3"), "low")).toEqual({ reasoning_effort: "low" });
+  });
+
+  test("K3:off 无法关思考,映射 low(官方 FAQ);auto 不发字段用服务端默认", () => {
+    expect(reasoningPayloadForProvider(moonshot, m("kimi-k3"), "off")).toEqual({ reasoning_effort: "low" });
+    expect(reasoningPayloadForProvider(moonshot, m("kimi-k3"), "auto")).toEqual({});
+  });
+
+  test("K3 变体:裸 k3(安卓 KIMI_K3_ALIAS)/带前缀/k3.5 同代延续;k30 不误伤", () => {
+    expect(reasoningPayloadForProvider(moonshot, m("k3"), "high")).toEqual({ reasoning_effort: "high" });
+    expect(reasoningPayloadForProvider(moonshot, m("moonshotai/Kimi-K3"), "high")).toEqual({ reasoning_effort: "high" });
+    expect(reasoningPayloadForProvider(moonshot, m("kimi-k3.5"), "high")).toEqual({ reasoning_effort: "high" });
+    expect(reasoningPayloadForProvider(moonshot, m("kimi-k30"), "high")).toEqual({ thinking: { type: "enabled" } });
+  });
+
+  test("K2.7-code:始终思考且传 disabled 会 400,一律不发 thinking", () => {
+    expect(reasoningPayloadForProvider(moonshot, m("kimi-k2.7-code"), "high")).toEqual({});
+    expect(reasoningPayloadForProvider(moonshot, m("kimi-k2.7-code-highspeed"), "off")).toEqual({});
+  });
+
+  test("K2.6:开思考补 keep:'all' 保留历史思考(#1586);关思考只发 type", () => {
+    expect(reasoningPayloadForProvider(moonshot, m("kimi-k2.6"), "high")).toEqual({
+      thinking: { type: "enabled", keep: "all" },
+    });
+    expect(reasoningPayloadForProvider(moonshot, m("kimi-k2.6"), "off")).toEqual({ thinking: { type: "disabled" } });
+  });
+
+  test("K2.5/kimi-latest 维持 thinking{type} 开关(现状不回归)", () => {
+    expect(reasoningPayloadForProvider(moonshot, m("kimi-k2.5"), "high")).toEqual({ thinking: { type: "enabled" } });
+    expect(reasoningPayloadForProvider(moonshot, m("kimi-latest"), "off")).toEqual({ thinking: { type: "disabled" } });
+  });
+
+  test("K3 经透传型中转(未知 host)同样收拢档位——K3 事实是模型级、跨渠道成立", () => {
+    const relay = { type: "openai", baseUrl: "https://relay.example.com/v1", apiKey: "k" } as unknown as Provider;
+    expect(reasoningPayloadForProvider(relay, m("kimi-k3"), "medium")).toEqual({ reasoning_effort: "high" });
+    expect(reasoningPayloadForProvider(relay, m("kimi-k3"), "xhigh")).toEqual({ reasoning_effort: "max" });
+    expect(reasoningPayloadForProvider(relay, m("kimi-k3"), "off")).toEqual({ reasoning_effort: "low" });
+    expect(reasoningPayloadForProvider(relay, m("kimi-k3"), "auto")).toEqual({});
+    // 非 K3 模型经中转不受影响,档位原样透传(既有兜底行为)。
+    expect(reasoningPayloadForProvider(relay, m("some-model"), "medium")).toEqual({ reasoning_effort: "medium" });
+  });
+
+  test("温度禁发:K2.5+ 采样参数官方固定(跨 host 生效);旧 kimi 与其他模型不受影响", () => {
+    const locked = ["kimi-k3", "k3", "kimi-k3.5", "kimi-k2.5", "kimi-k2.6", "kimi-k2.7-code", "Pro/moonshotai/Kimi-K2.5"];
+    for (const id of locked) {
+      expect(isModelAllowTemperature({ modelId: id } as unknown as Model)).toBe(false);
+    }
+    const allowed = ["kimi-latest", "moonshot-v1-8k", "kimi-k2", "gpt-4o"];
+    for (const id of allowed) {
+      expect(isModelAllowTemperature({ modelId: id } as unknown as Model)).toBe(true);
+    }
+    // 既有规则回归:o 系与精确 "gpt-5" 仍禁温度
+    expect(isModelAllowTemperature({ modelId: "o3" } as unknown as Model)).toBe(false);
+    expect(isModelAllowTemperature({ modelId: "gpt-5" } as unknown as Model)).toBe(false);
+  });
+});
+
+// 2026-09 厂商新格式方言(官方文档口径):智谱 GLM-5.2+/火山 Seed 2.x 的 effort 增强、
+// 强制思考型号的 off 防御、DeepSeek v4 收拢表、硅基 V4 系 effort、百炼 K3 budget 防御。
+describe("reasoningPayloadForProvider — 2026-09 新格式方言", () => {
+  const mk = (baseUrl: string) => ({ type: "openai", baseUrl, apiKey: "k" }) as unknown as Provider;
+  const model = (modelId: string) => ({ modelId, abilities: ["REASONING"] }) as unknown as Model;
+  const zhipu = mk("https://open.bigmodel.cn/api/paas/v4");
+  const ark = mk("https://ark.cn-beijing.volces.com/api/v3");
+  const deepseek = mk("https://api.deepseek.com/v1");
+  const siliconflow = mk("https://api.siliconflow.cn/v1");
+  const dashscope = mk("https://dashscope.aliyuncs.com/compatible-mode/v1");
+
+  test("智谱 GLM-5.3:effort 查窄表并发;off 不发 disabled(强制思考,官方 400)", () => {
+    expect(reasoningPayloadForProvider(zhipu, model("glm-5.3"), "MAX")).toEqual({
+      thinking: { type: "enabled" },
+      reasoning_effort: "max",
+    });
+    expect(reasoningPayloadForProvider(zhipu, model("glm-5.3-flash"), "medium")).toEqual({
+      thinking: { type: "enabled" },
+      reasoning_effort: "high",
+    });
+    expect(reasoningPayloadForProvider(zhipu, model("glm-5.3"), "off")).toEqual({});
+    expect(reasoningPayloadForProvider(zhipu, model("glm-4.7"), "off")).toEqual({});
+  });
+
+  test("智谱 GLM-5.2:effort 原样透传(服务端收全七档);可关思考", () => {
+    expect(reasoningPayloadForProvider(zhipu, model("glm-5.2"), "xhigh")).toEqual({
+      thinking: { type: "enabled" },
+      reasoning_effort: "xhigh",
+    });
+    expect(reasoningPayloadForProvider(zhipu, model("glm-5.2"), "off")).toEqual({
+      thinking: { type: "disabled" },
+    });
+  });
+
+  test("智谱 GLM-5.1 及以下:仅 thinking 开关,不发 effort(现状保持)", () => {
+    expect(reasoningPayloadForProvider(zhipu, model("glm-5"), "max")).toEqual({
+      thinking: { type: "enabled" },
+    });
+  });
+
+  test("火山 Doubao Seed 2.x:effort 查 seed2 表(minimal 档映 low,xhigh/max 收 high);老系不发", () => {
+    expect(reasoningPayloadForProvider(ark, model("doubao-seed-2-0-pro-260215"), "max")).toEqual({
+      thinking: { type: "enabled" },
+      reasoning_effort: "high",
+    });
+    expect(reasoningPayloadForProvider(ark, model("doubao-seed-2-0-mini"), "minimal")).toEqual({
+      thinking: { type: "enabled" },
+      reasoning_effort: "low",
+    });
+    expect(reasoningPayloadForProvider(ark, model("doubao-seed-2-0-pro-260215"), "off")).toEqual({
+      thinking: { type: "disabled" },
+    });
+    expect(reasoningPayloadForProvider(ark, model("doubao-1.5-thinking-pro"), "max")).toEqual({
+      thinking: { type: "enabled" },
+    });
+  });
+
+  test("DeepSeek 官方:v4 收拢表 xhigh→high(2026-09 口径,与 K3 表拆分)", () => {
+    expect(reasoningPayloadForProvider(deepseek, model("deepseek-v4-pro"), "xhigh")).toEqual({
+      thinking: { type: "enabled" },
+      reasoning_effort: "high",
+    });
+    expect(reasoningPayloadForProvider(deepseek, model("deepseek-v4-pro"), "max")).toEqual({
+      thinking: { type: "enabled" },
+      reasoning_effort: "max",
+    });
+  });
+
+  test("SiliconFlow V4 系:enable_thinking+effort 原样并发;白名单一般模型不发 effort", () => {
+    expect(reasoningPayloadForProvider(siliconflow, model("Pro/deepseek-ai/DeepSeek-V4-Pro"), "xhigh")).toEqual({
+      enable_thinking: true,
+      reasoning_effort: "xhigh",
+    });
+    expect(reasoningPayloadForProvider(siliconflow, model("Qwen/Qwen3.5-397B-A17B"), "high")).toEqual({
+      enable_thinking: true,
+    });
+  });
+
+  test("百炼:qwen 系发 thinking_budget;直供 kimi-k3 官方不支持该参数,只发开关", () => {
+    expect(reasoningPayloadForProvider(dashscope, model("qwen3-max"), "high")).toEqual({
+      enable_thinking: true,
+      thinking_budget: 8000,
+    });
+    expect(reasoningPayloadForProvider(dashscope, model("kimi-k3"), "high")).toEqual({
+      enable_thinking: true,
+    });
+  });
+});
+
+describe("responseApiMessagesFromUiMessages — 历史 reasoning 项方言（2026-09-05 内测火山 400）", () => {
+  const twoRoundMessages = [
+    { id: "u1", role: "USER", parts: [{ type: "text", text: "第一问" }], annotations: [], createdAt: 1 },
+    {
+      id: "a1",
+      role: "ASSISTANT",
+      parts: [
+        { type: "reasoning", reasoning: "历史思考", createdAt: "2026-09-05T14:00:00Z" },
+        { type: "tool", toolCallId: "call_1", toolName: "lookup", input: "{}", output: [{ type: "text", text: "r" }], approvalState: { type: "auto" } },
+        { type: "text", text: "第一答" },
+      ],
+      annotations: [],
+      createdAt: 2,
+    },
+    { id: "u2", role: "USER", parts: [{ type: "text", text: "第二问" }], annotations: [], createdAt: 3 },
+  ] as never[];
+
+  test("默认（官方语义）回传 reasoning 项，fc/out/text 完整", () => {
+    const input = responseApiMessagesFromUiMessages(twoRoundMessages) as Array<Record<string, unknown>>;
+    expect(input.map((item) => String(item.type ?? item.role))).toEqual([
+      "user", "reasoning", "function_call", "function_call_output", "assistant", "user",
+    ]);
+  });
+
+  test("includeReasoningItems=false（第三方端点）剥除 reasoning 项，其余项不受影响", () => {
+    const input = responseApiMessagesFromUiMessages(twoRoundMessages, undefined, false) as Array<Record<string, unknown>>;
+    expect(input.map((item) => String(item.type ?? item.role))).toEqual([
+      "user", "function_call", "function_call_output", "assistant", "user",
+    ]);
+    // 火山报障核心断言：任何项都不缺 role/type 判别字段，序列化无 null
+    expect(JSON.parse(JSON.stringify(input)).every((item: unknown) => item !== null)).toBe(true);
+  });
+
+  // 2026-09-07 内测报障:第二问必报 MissingParameter input.arguments。历史库里可能残留
+  // 空参工具卡(旧版 Responses 双 id 串台产的幽灵卡),历史编码必须把它归一成 "{}" 而不是
+  // 原样发空串——否则老会话每问必炸,且用户无从修复(卡已落库)。
+  test("历史里的空参工具卡回传时归一成 \"{}\"（严格端点必填校验）", () => {
+    const withEmptyArgs = [
+      {
+        id: "a1",
+        role: "ASSISTANT",
+        parts: [
+          { type: "tool", toolCallId: "call_ghost", toolName: "lookup", input: "", output: [], approvalState: { type: "auto" } },
+          { type: "text", text: "答" },
+        ],
+        annotations: [],
+        createdAt: 1,
+      },
+      { id: "u2", role: "USER", parts: [{ type: "text", text: "第二问" }], annotations: [], createdAt: 2 },
+    ] as never[];
+    const input = responseApiMessagesFromUiMessages(withEmptyArgs) as Array<Record<string, unknown>>;
+    const call = input.find((item) => item.type === "function_call")!;
+    expect(call.arguments).toBe("{}");
+    // 配对的结果项同样不能是空串（同类必填校验）。
+    const output = input.find((item) => item.type === "function_call_output")!;
+    expect(String(output.output ?? "").length).toBeGreaterThan(0);
+  });
+
+  test("空结果的 tool_result 在 Claude 侧不产空 text block（Anthropic 拒空块）", () => {
+    const blocks = claudeBlocksFromUiParts([]);
+    expect(blocks).toHaveLength(1);
+    expect(String((blocks[0] as { text?: string }).text ?? "").length).toBeGreaterThan(0);
+  });
+
+  test("chat-completions 历史同纪律：空参 tool_calls 也归一成 \"{}\"", () => {
+    const items: Array<Record<string, unknown>> = [];
+    appendAssistantApiMessages(
+      items as never,
+      {
+        id: "a1",
+        role: "ASSISTANT",
+        parts: [
+          { type: "tool", toolCallId: "call_ghost", toolName: "lookup", input: "", output: [], approvalState: { type: "auto" } },
+        ],
+        annotations: [],
+        createdAt: 1,
+      } as never,
+      true,
+    );
+    const assistantTurn = items.find((item) => Array.isArray(item.tool_calls))!;
+    const toolCalls = assistantTurn.tool_calls as Array<{ function: { arguments: string } }>;
+    expect(toolCalls[0]!.function.arguments).toBe("{}");
   });
 });

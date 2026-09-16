@@ -8,9 +8,8 @@ import { id, isRecord, reasoningFromParts, safeJsonParse, visibleReasoningFromMe
 import { MODELS_DEV_CACHE_PATH } from "../foundation/paths";
 import { fetchWithTimeout, readWithIdleTimeout } from "../foundation/net";
 import { initialApprovalState, toolNeedsApproval } from "../tools/approval";
-import { openAiToolOutput, partsToToolResultText, resolvedToolOutput, toolExecutionErrorPayload } from "../tools/format";
+import { toolArgumentsJson, toolExecutionErrorPayload, toolResultTextForApi } from "../tools/format";
 import {
-  apiContentText,
   claudeBlocksFromUiParts,
 } from "./message-builder";
 import { ensureReasoningPart, finishReasoningParts, normalizeGeneratedImageUrl } from "./parts";
@@ -20,6 +19,7 @@ import {
   jsonBody,
   textBody,
 } from "../model-providers";
+import { contextWindowFor } from "../model-providers/model-limits";
 import { addLog } from "../api/logs";
 import { touchStream } from "../api/sse";
 import { MAX_TOOL_STEPS, mergeTokenUsage, runStreamingToolLoop, toolCallContext, STREAM_IDLE_TIMEOUT_MS, type ProviderRoundAdapter, type NormalizedToolCall } from "./tool-loop";
@@ -33,6 +33,20 @@ export { MAX_TOOL_STEPS, toolCallContext };
  *  fragment——用类型判别替代字符串前缀匹配(前缀匹配曾把 Anthropic 的
  *  overloaded/rate_limit 错误当碎片吞掉,残缺回答被当正常完成落库)。 */
 export class UpstreamStreamError extends Error {}
+
+/** 上游非 2xx 统一报文(B:404 形态诊断)。404 几乎总是「URL 打错了地方」——Base URL
+ *  缺/多路径段(最常见漏 /v1)、chatCompletionsPath 拼写、中转平台改版,或模型 ID 不存在
+ *  (Anthropic 的 model not_found 也走 404)。这类错误的响应正文往往是一页 HTML 或空串,
+ *  毫无线索,故报文带上最终请求 URL 让用户一眼定位;其他状态码语义清晰(401/403 鉴权、
+ *  429 限流、400 参数),厂商正文自带解释,保持原样拼接。 */
+export function upstreamHttpError(providerItem: Provider, url: string, status: number, bodyText: string): Error {
+  const body = bodyText.slice(0, 500);
+  if (status !== 404) return new Error(`${providerItem.name} ${status}: ${body}`);
+  return new Error(
+    `${providerItem.name} 404: 接口路径不存在。实际请求 URL: ${url}\n` +
+      `请检查 Base URL 形态(是否缺少或多了 /v1 等路径段)与模型 ID 是否存在。${body ? `\n${body}` : ""}`,
+  );
+}
 
 // models.dev 开源模型目录缓存 —— 用于查询模型的最大上下文窗口,显示在对话统计行
 // (分子 = 当前上下文 = promptTokens,分母 = 模型 contextLimit)。
@@ -97,39 +111,10 @@ export async function loadModelsDev(force = false): Promise<void> {
   return modelsDevLoading;
 }
 
-// 按 provider type + modelId 查 context limit。匹配不到返回 null。
-// ① 精确:provider type → models.dev provider key(claude→anthropic),modelId 精确匹配;
-// ② 版本后缀前缀:claude-3-5-sonnet → claude-3-5-sonnet-20241022(models.dev 用带日期的 id,
-//    用户常用简短 id)。用 `modelId + "-"` 锚定,避免 gpt-4 误匹配 gpt-4o;
-// ③ 跨 provider:中转站可能 type=openai 但实际模型(如 deepseek)在别的 provider下;
-// ④ 都没有 → null(前端只显示分子)。
-export function lookupContextLimit(
-  catalog: Record<string, any> | null,
-  providerType: string,
-  modelId: string,
-): number | null {
-  if (!catalog || !modelId) return null;
-  const providerKey = providerType === "claude" ? "anthropic" : providerType;
-  const contextOf = (models: any): number | null => {
-    if (!models) return null;
-    const exact = models[modelId]?.limit?.context;
-    if (typeof exact === "number" && exact > 0) return exact;
-    for (const key of Object.keys(models)) {
-      if (key.startsWith(`${modelId}-`) || key.startsWith(`${modelId}.`)) {
-        const v = models[key]?.limit?.context;
-        if (typeof v === "number" && v > 0) return v;
-      }
-    }
-    return null;
-  };
-  const primary = contextOf(catalog[providerKey]?.models);
-  if (primary) return primary;
-  for (const key of Object.keys(catalog)) {
-    const v = contextOf(catalog[key]?.models);
-    if (v) return v;
-  }
-  return null;
-}
+// 模型极限查表已迁至 model-providers/model-limits.ts(按端点身份取值 + 输出上限自洽性
+// 校验)。此前这里按"provider type + 名字搜全目录"命中第一个,决定统计行分母时无害,
+// 成为出站 max_tokens 来源后就是硬 400 的来源(2026-09-09 智谱 GLM-5.3 报障)。
+// 本文件保留 fillContextLimit —— 它是 usage 回填,依赖 findModel/modelsDevCache。
 
 // 给 message.usage 填充 contextLimit(基于 msg.modelId 查 models.dev)。cache 未加载或
 // 匹配不到时填 null(降级:前端只显示分子)。已填则跳过,避免重复 findModel。
@@ -146,7 +131,7 @@ export function fillContextLimit(msg: Message) {
     usage.contextLimit = null;
     return;
   }
-  usage.contextLimit = lookupContextLimit(modelsDevCache, found.provider.type, found.model.modelId);
+  usage.contextLimit = contextWindowFor(modelsDevCache, found.provider, found.model.modelId);
 }
 
 export function appendUsageFromRaw(msg: Message | undefined, raw: any) {
@@ -206,7 +191,7 @@ export async function fetchText(
     responseBody: textBody(rawText),
     error: response.ok ? undefined : textBody(rawText),
   });
-  if (!response.ok) throw new Error(`${providerItem.name} ${response.status}: ${rawText.slice(0, 500)}`);
+  if (!response.ok) throw upstreamHttpError(providerItem, url, response.status, rawText);
   return pick(raw)?.trim() || "(empty response)";
 }
 
@@ -281,7 +266,12 @@ export async function readClaudeStreamingRound(
     if (!dataJson || typeof dataJson !== "object") return;
     if (eventName === "message_start") {
       const u = dataJson.message?.usage;
-      if (u) setUsage(u);
+      // anthropic 语义:message_start.usage.output_tokens 是起始计数(常为 1),最终值
+      // 只来自 message_delta。Kimi coding 等兼容端点 message_delta 不带 usage,若把
+      // 起始值当真:completionTokens 恒 1,ensureUsage 字段级估算兜底被非零值挡住,
+      // TPS 显示≈0(内测两连反馈的最终根因)。message_start 只吸收 input 侧字段;
+      // output 侧留给 message_delta——官方端点正常覆盖,兼容端点落估算兜底。
+      if (u) setUsage({ ...u, output_tokens: 0 });
       return;
     }
     if (eventName === "message_delta") {
@@ -309,7 +299,7 @@ export async function readClaudeStreamingRound(
             toolCallId: String(block.id ?? ""),
             toolName: String(block.name ?? ""),
             input: "",
-            approvalState: initialApprovalState(String(block.name ?? ""), assistant),
+            approvalState: initialApprovalState(String(block.name ?? ""), assistant, hooks.conversation),
           });
           touchStream(hooks);
         }
@@ -454,13 +444,14 @@ export async function readClaudeJsonRound(
       hooks.sink?.({ kind: "text_delta", text: block.text });
     } else if (type === "tool_use" && hooks.message) {
       const name = String(block.name ?? "");
+      const inputJson = JSON.stringify(isRecord(block.input) ? block.input : {});
       finishReasoningParts(hooks.message);
       hooks.sink?.({
         kind: "tool_call_created",
         toolCallId: String(block.id ?? id()),
         toolName: name,
-        input: JSON.stringify(isRecord(block.input) ? block.input : {}),
-        approvalState: initialApprovalState(name, assistant),
+        input: inputJson,
+        approvalState: initialApprovalState(name, assistant, hooks.conversation, inputJson),
       });
       touchStream(hooks);
     }
@@ -497,6 +488,8 @@ export async function streamClaudeChatWithTools(
       headers: nonStream ? headers : { ...headers, Accept: "text/event-stream" },
       body: JSON.stringify(requestBody),
       signal: sig,
+      // 注意:无需在此传 Bun timeout 键。net.ts 的 fetch 拦截器已对所有走 globalThis.fetch
+      // 的调用统一注入 timeout:0(禁用 Bun 300s socket 空闲定时器),计时权归 headerTimeoutMs。
     }),
     // R3-1:头超时统一 600s(流式/非流式同值,用户需求 2026-08-01:非流式对齐流式——
     // 非流式响应头要等全文生成完,长思考模型 5 分钟以上很常见,300s 会误杀)。
@@ -601,7 +594,7 @@ export async function fetchClaudeTextWithTools(
       responseBody: textBody(rawText),
       error: response.ok ? undefined : textBody(rawText),
     });
-    if (!response.ok) throw new Error(`${providerItem.name} ${response.status}: ${rawText.slice(0, 500)}`);
+    if (!response.ok) throw upstreamHttpError(providerItem, url, response.status, rawText);
 
     const content: JsonValue[] = Array.isArray(raw.content) ? raw.content : [];
     const text = claudeTextFromContent(content);
@@ -616,7 +609,9 @@ export async function fetchClaudeTextWithTools(
     const dispatchCtx = toolCallContext(hooks);
     // Same rationale as the stream path: bail out of the turn if any tool needs approval so
     // we don't end up sending an unanswered tool_use to Anthropic on the next turn.
-    const hasPendingInBatch = toolUses.some((toolUse) => toolNeedsApproval(String(toolUse.name ?? ""), assistant));
+    const hasPendingInBatch = toolUses.some((toolUse) =>
+      toolNeedsApproval(String(toolUse.name ?? ""), assistant, hooks?.conversation, JSON.stringify(isRecord(toolUse.input) ? toolUse.input : {})),
+    );
     for (const toolUse of toolUses) {
       // R3-4:停止后剩余工具不再执行。
       if (signal?.aborted) throw new DOMException("Generation stopped", "AbortError");
@@ -634,7 +629,7 @@ export async function fetchClaudeTextWithTools(
         toolName: toolCall.function.name,
         input: toolCall.function.arguments,
         output: [],
-        approvalState: initialApprovalState(toolCall.function.name, assistant),
+        approvalState: initialApprovalState(toolCall.function.name, assistant, hooks?.conversation, toolCall.function.arguments),
       };
       if (hooks?.message) {
         finishReasoningParts(hooks.message);
@@ -757,7 +752,8 @@ function applyGoogleRoundChunk(
           toolCallId: callId,
           toolName: name,
           input: JSON.stringify(args),
-          approvalState: initialApprovalState(name, assistant),
+          // Gemini 函数调用整体到达，建卡即参数齐备的终局审批态
+          approvalState: initialApprovalState(name, assistant, hooks.conversation, JSON.stringify(args)),
         });
         touchStream(hooks);
       }
@@ -879,6 +875,7 @@ export async function streamGoogleChatWithTools(
       headers: nonStream ? headers : { ...headers, Accept: "text/event-stream" },
       body: JSON.stringify(requestBody),
       signal: sig,
+      // Bun timeout 由 net.ts fetch 拦截器统一注入 timeout:0(见 Claude 适配器处注释)。
     }),
     // R3-1:头超时统一 600s(流式/非流式同值,用户需求 2026-08-01:非流式对齐流式,
     // 理由同 Claude/OpenAI 适配器处注释)。
@@ -897,8 +894,12 @@ export async function streamGoogleChatWithTools(
     },
     encodeNextTurn(result, toolResults) {
       const round = result.replay as GoogleStreamRoundResult;
+      // result 文本经 toolResultTextForApi(工具结果的唯一投影,同 OpenAI/Claude 两系):
+      // ①空输出给确定性占位而非空串——Gemini 不像火山那样按必填拒,但"有调用无结果"
+      // 回灌给模型的表述必须与另两系逐字一致(否则模型行为随 provider 漂移);②无 text
+      // part 的输出(纯图片等)不再退化成空串,由 openAiToolOutput 兜底序列化。
       const responseParts = toolResults.map(({ call, output }) => ({
-        functionResponse: { name: call.name, response: { result: apiContentText(partsToToolResultText(output)) } },
+        functionResponse: { name: call.name, response: { result: toolResultTextForApi({ output }) } },
       }));
       // Gemini 要求把模型这轮的 parts（含 functionCall）原样回放，再追加 user 的 functionResponse。
       contents = [
@@ -960,7 +961,7 @@ export async function fetchOpenAiText(
       responseBody: textBody(rawText),
       error: response.ok ? undefined : textBody(rawText),
     });
-    if (!response.ok) throw new Error(`${providerItem.name} ${response.status}: ${rawText.slice(0, 500)}`);
+    if (!response.ok) throw upstreamHttpError(providerItem, url, response.status, rawText);
 
     const assistantMessage = raw.choices?.[0]?.message ?? {};
     const content = completionMessageText(raw);
@@ -972,18 +973,23 @@ export async function fetchOpenAiText(
     if (toolCalls.length === 0) return allContent.trim() || "(empty response)";
 
     const toolMessages = [];
-    const hasPendingInBatch = toolCalls.some((toolCall: any) => toolNeedsApproval(String(toolCall?.function?.name ?? ""), assistant));
+    const hasPendingInBatch = toolCalls.some((toolCall: any) =>
+      toolNeedsApproval(String(toolCall?.function?.name ?? ""), assistant, hooks?.conversation, toolArgumentsJson(toolCall?.function?.arguments)),
+    );
     const dispatchCtx = toolCallContext(hooks);
     for (const toolCall of toolCalls) {
       // R3-4:停止后剩余工具不再执行。
       if (signal?.aborted) throw new DOMException("Generation stopped", "AbortError");
+      // arguments 经 toolArgumentsJson 归一(""→"{}"):不规范上游会回空串,?? 接不住,空参
+      // 工具卡落库后在下一轮历史编码里就是严格端点 400 的弹药(见 toolArgumentsJson 头注)。
+      const toolArguments = toolArgumentsJson(toolCall.function?.arguments);
       const toolPart: ToolPart = {
         type: "tool",
         toolCallId: String(toolCall.id ?? id()),
         toolName: String(toolCall.function?.name ?? ""),
-        input: String(toolCall.function?.arguments ?? "{}"),
+        input: toolArguments,
         output: [],
-        approvalState: initialApprovalState(String(toolCall.function?.name ?? ""), assistant),
+        approvalState: initialApprovalState(String(toolCall.function?.name ?? ""), assistant, hooks?.conversation, toolArguments),
       };
       if (hooks?.message) {
         finishReasoningParts(hooks.message);
@@ -1006,16 +1012,18 @@ export async function fetchOpenAiText(
         toolResult = { output: [toolExecutionErrorPayload(err)] };
       }
       const outputParts = toolResult.output;
+      // 本地 toolPart 恒记录输出:sink 分支的卡在消息里(由应用器写),但下面的结果项投影
+      // 读的是这个本地对象——不写就会被当成"无输出"而落到中断占位文案。
+      toolPart.output = outputParts;
       if (hooks?.sink) {
         hooks.sink({ kind: "tool_result", toolCallId: String((toolPart as Record<string, JsonValue>).toolCallId), output: outputParts });
       } else {
-        toolPart.output = outputParts;
         touchStream(hooks);
       }
       toolMessages.push({
         role: "tool",
         tool_call_id: (toolPart as Record<string, JsonValue>).toolCallId,
-        content: openAiToolOutput(outputParts),
+        content: toolResultTextForApi(toolPart),
       });
     }
     if (hasPendingInBatch) {
@@ -1082,7 +1090,8 @@ export function completionMessageText(raw: any): string {
 
 export function parseSseChunks(text: string) {
   return text
-    .split(/\n\n+/)
+    // 事件分隔认 CRLF(与各家 reader 的读循环分帧一致),理由见 readOpenAiStream 注释。
+    .split(/\r?\n\r?\n/)
     .flatMap((block) => {
       const data = block
         .split(/\r?\n/)
@@ -1138,7 +1147,9 @@ export function responseEventToDelta(raw: any) {
       return {
         tool_calls: [{
           index: Number(raw.output_index ?? 0),
-          id: String(item.call_id ?? item.id ?? ""),
+          // 取 call_id(工具调用配对 id，spec 必填)；item.id(fc_…，输出条目 id)只作劣质
+          // 中转缺 call_id 时的兜底。真值判定而非 ??：空串也要落到兜底(同 mergeToolCallDeltas)。
+          id: String(item.call_id || item.id || ""),
           type: "function",
           function: {
             name: String(item.name ?? ""),
@@ -1170,11 +1181,18 @@ export function responseEventToDelta(raw: any) {
       };
     }
   }
+  // 参数帧只认 call_id，绝不取 item_id——Responses 的 function_call 带两个语义不同的 id
+  // (官方 OpenAPI FunctionToolCall):item.id 是【输出条目】id(fc_…，可选)，item.call_id 是
+  // 【工具调用】配对 id(call_…，必填)；而 arguments.delta/done 两帧按 spec 只带 item_id
+  // (即 fc_…)、根本没有 call_id 字段。取 item_id 当调用 id 会把已建槽的 call_… 改写成 fc_…：
+  // ①流内已建的卡(call_…)从此收不到 tool_input_delta，参数永久空；②轮末循环层按 fc_… 另
+  // 建一张卡 —— 一次调用落库两张卡，空参幽灵卡进第二轮历史编码即 400(火山 MissingParameter
+  // input.arguments，2026-09-07 内测报障)。槽位对应本就靠 output_index，id 在此帧是冗余的。
   if (type === "response.function_call_arguments.delta") {
     return {
       tool_calls: [{
         index: Number(raw.output_index ?? 0),
-        id: String(raw.item_id ?? raw.call_id ?? ""),
+        id: String(raw.call_id ?? ""),
         type: "function",
         function: { name: "", arguments: String(raw.delta ?? "") },
       }],
@@ -1184,7 +1202,7 @@ export function responseEventToDelta(raw: any) {
     return {
       tool_calls: [{
         index: Number(raw.output_index ?? 0),
-        id: String(raw.item_id ?? raw.call_id ?? ""),
+        id: String(raw.call_id ?? ""),
         type: "function",
         function: { name: "", arguments: String(raw.arguments ?? "") },
         _rikkahubSnapshot: true,
@@ -1243,7 +1261,10 @@ export async function readOpenAiStream(
     const { done, value } = await readWithIdleTimeout(() => reader.read(), STREAM_IDLE_TIMEOUT_MS);
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split(/\n\n+/);
+    // 内测反馈(Kimi 流式卡顿排查):事件分隔统一认 CRLF——HTTP/SSE 规范允许 \r\n,上游或
+    // 中间层用 \r\n\r\n 分隔时,旧 /\n\n+/ 整流切不开,全程攒 buffer 直到流结束才兜底
+    // 解析(表现为一个字不出→最后哗啦全出)。与 readClaudeStreamingRound/Google reader 对齐。
+    const parts = buffer.split(/\r?\n\r?\n/);
     buffer = parts.pop() ?? "";
     for (const part of parts) {
       for (const payload of parseSseChunks(part)) {
@@ -1286,6 +1307,7 @@ export function applyOpenAiDelta(
   rawEvent: any,
   hooks: StreamHooksWithSink,
   toolCalls: any[],
+  assistant?: Assistant,
 ) {
   appendUsageFromRaw(hooks.message, rawEvent);
   let content = "";
@@ -1323,6 +1345,36 @@ export function applyOpenAiDelta(
   if (Array.isArray(delta.tool_calls)) {
     const mode = isSnapshot || delta.tool_calls.some((call: any) => call?._rikkahubSnapshot) ? "snapshot" : "delta";
     mergeToolCallDeltas(toolCalls, delta.tool_calls, mode);
+    // 流式(delta)模式下即时建卡+参数流(对齐 Claude reader 的 content_block_start /
+    // input_json_delta 行为):此前 OpenAI 系工具调用在整轮流读完才由循环层建卡,而
+    // write/edit 等工具的参数(整个文件内容)本身就是流式生成的,这段窗口可长达几十秒
+    // ——期间思考卡持续计时、无任何工具反馈。id+name 齐备即宣告建卡(审批态用无参数
+    // 下界,循环层 pre-scan 后经幂等更新上调终局);后续参数增量走 tool_input_delta。
+    // snapshot(非流式/回放)模式无实时窗口,仍由循环层建卡。
+    if (mode === "delta" && hooks.sink && hooks.message) {
+      for (const call of toolCalls) {
+        if (!call || typeof call !== "object") continue;
+        const callId = String(call.id ?? "");
+        const callName = String(call.function?.name ?? "");
+        if (!callId || !callName) continue;
+        const args = String(call.function?.arguments ?? "");
+        if (!call._announced) {
+          call._announced = true;
+          finishReasoningParts(hooks.message);
+          hooks.sink({
+            kind: "tool_call_created",
+            toolCallId: callId,
+            toolName: callName,
+            input: args,
+            approvalState: assistant
+              ? initialApprovalState(callName, assistant, hooks.conversation)
+              : { type: "auto" },
+          });
+        } else if (args) {
+          hooks.sink({ kind: "tool_input_delta", toolCallId: callId, input: args });
+        }
+      }
+    }
   }
   return { content, reasoning };
 }
@@ -1333,9 +1385,10 @@ export async function fetchOpenAiAuxiliaryStream(
   body: Record<string, any>,
   providerItem: Provider,
   onDelta: (text: string) => void,
+  signal?: AbortSignal,
 ) {
   const started = Date.now();
-  const response = await fetchWithTimeout(url, { method: "POST", headers, body: JSON.stringify(body), timeoutMs: AUX_STREAM_TIMEOUT_MS });
+  const response = await fetchWithTimeout(url, { method: "POST", headers: { ...headers, Accept: "text/event-stream" }, body: JSON.stringify(body), timeoutMs: AUX_STREAM_TIMEOUT_MS, signal });
   let text = "";
   if (response.ok) {
     text = await readOpenAiStream(response, (delta) => {
@@ -1361,7 +1414,7 @@ export async function fetchOpenAiAuxiliaryStream(
     responseBody: textBody(text),
     error: response.ok ? undefined : textBody(text),
   });
-  if (!response.ok) throw new Error(`${providerItem.name} ${response.status}: ${text.slice(0, 500)}`);
+  if (!response.ok) throw upstreamHttpError(providerItem, url, response.status, text);
   return text.trim() || "(empty response)";
 }
 
@@ -1371,9 +1424,10 @@ export async function fetchClaudeAuxiliaryStream(
   body: Record<string, any>,
   providerItem: Provider,
   onDelta: (text: string) => void,
+  signal?: AbortSignal,
 ) {
   const started = Date.now();
-  const response = await fetchWithTimeout(url, { method: "POST", headers, body: JSON.stringify(body), timeoutMs: AUX_STREAM_TIMEOUT_MS });
+  const response = await fetchWithTimeout(url, { method: "POST", headers: { ...headers, Accept: "text/event-stream" }, body: JSON.stringify(body), timeoutMs: AUX_STREAM_TIMEOUT_MS, signal });
   if (!response.ok) {
     const text = await response.text();
     addLog({
@@ -1391,7 +1445,7 @@ export async function fetchClaudeAuxiliaryStream(
       responseBody: textBody(text),
       error: textBody(text),
     });
-    throw new Error(`${providerItem.name} ${response.status}: ${text.slice(0, 500)}`);
+    throw upstreamHttpError(providerItem, url, response.status, text);
   }
   const text = await readClaudeStream(response, (content) => {
     onDelta(content);
@@ -1439,7 +1493,8 @@ export async function readClaudeStream(response: Response, onDelta: (text: strin
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split(/\n\n+/);
+    // 事件分隔认 CRLF,理由见 readOpenAiStream 同位置注释。
+    const parts = buffer.split(/\r?\n\r?\n/);
     buffer = parts.pop() ?? "";
     for (const part of parts) {
       for (const payload of parseSseChunks(part)) {
@@ -1475,9 +1530,10 @@ export async function fetchGoogleAuxiliaryStream(
   body: JsonValue | object,
   providerItem: Provider,
   onDelta: (text: string) => void,
+  signal?: AbortSignal,
 ) {
   const started = Date.now();
-  const response = await fetchWithTimeout(url, { method: "POST", headers, body: JSON.stringify(body), timeoutMs: AUX_STREAM_TIMEOUT_MS });
+  const response = await fetchWithTimeout(url, { method: "POST", headers: { ...headers, Accept: "text/event-stream" }, body: JSON.stringify(body), timeoutMs: AUX_STREAM_TIMEOUT_MS, signal });
   const rawText = await response.text();
   addLog({
     providerId: providerItem.id,
@@ -1494,7 +1550,7 @@ export async function fetchGoogleAuxiliaryStream(
     responseBody: textBody(rawText),
     error: response.ok ? undefined : textBody(rawText),
   });
-  if (!response.ok) throw new Error(`${providerItem.name} ${response.status}: ${rawText.slice(0, 500)}`);
+  if (!response.ok) throw upstreamHttpError(providerItem, url, response.status, rawText);
   const chunks = rawText
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -1517,7 +1573,7 @@ export async function fetchGoogleAuxiliaryStream(
   return text.trim() || "(empty response)";
 }
 
-export function readOpenAiSseTextIntoMessage(rawText: string, hooks: StreamHooksWithSink, toolCalls: any[]) {
+export function readOpenAiSseTextIntoMessage(rawText: string, hooks: StreamHooksWithSink, toolCalls: any[], assistant?: Assistant) {
   let content = "";
   let reasoning = "";
   for (const payload of parseSseChunks(rawText)) {
@@ -1529,7 +1585,7 @@ export function readOpenAiSseTextIntoMessage(rawText: string, hooks: StreamHooks
         appendUsageFromRaw(hooks.message, raw);
         continue;
       }
-      const applied = applyOpenAiDelta(delta, raw, hooks, toolCalls);
+      const applied = applyOpenAiDelta(delta, raw, hooks, toolCalls, assistant);
       content += applied.content;
       reasoning += applied.reasoning;
     } catch {
@@ -1549,12 +1605,34 @@ export function compactAssistantToolMessage(content: string, toolCalls: any[], r
   return payload;
 }
 
-export function responseApiToolCallItems(toolCalls: any[]) {
-  return toolCalls.map((toolCall) => ({
+// ===== 流式续传回放纪律：只消费归一化密集数组（RoundResult.toolCalls）=====
+// 流式 toolCalls 按上游 index/output_index 建槽，是潜在稀疏数组：Responses API 的
+// output_index 语义是"输出序列位置"，reasoning/内置工具占号后 function_call 不从 0
+// 起（必然产洞）；chat-completions 的 index 语义是"tool_calls 数组内序号"（规范上
+// 从 0 连续，仅不规范中转会跳号）。洞经 JSON.stringify 变成续传体里的 null 项，
+// 火山等严格端点直接 400（MissingParameter input.role，2026-09-05 内测报障）；且
+// 原始条目缺 id 时与工具结果项的兜底 id 配对断裂。readRound 归一化已过滤洞/无名
+// 并兜底 id，续传两分支一律经下面两个投影函数消费它，原始 replay 数组不得进续传体。
+
+/** Responses API 续传的 function_call 回放项。arguments 再经 toolArgumentsJson:
+ *  readRound 归一化已做过一次(幂等),这里重做一次是为了让"上线的 function_call 项
+ *  恒非空参"成为本函数的局部性质——未来新 provider 若自建 NormalizedToolCall 而漏了
+ *  归一化,也不会从这条路把空串送上去。 */
+export function responseApiToolCallItems(toolCalls: NormalizedToolCall[]) {
+  return toolCalls.map((call) => ({
     type: "function_call",
-    call_id: String(toolCall.id ?? ""),
-    name: String(toolCall.function?.name ?? ""),
-    arguments: String(toolCall.function?.arguments ?? "{}"),
+    call_id: call.id,
+    name: call.name,
+    arguments: toolArgumentsJson(call.arguments),
+  }));
+}
+
+/** chat-completions 续传的 tool_calls 回放（OpenAI 嵌套形态）。arguments 同上归一。 */
+export function chatToolCallsFromNormalized(toolCalls: NormalizedToolCall[]) {
+  return toolCalls.map((call) => ({
+    id: call.id,
+    type: "function",
+    function: { name: call.name, arguments: toolArgumentsJson(call.arguments) },
   }));
 }
 
@@ -1587,7 +1665,10 @@ export function mergeToolCallDeltas(existing: any[], deltaCalls: any[], mode: "d
     const inferredName = !currentName && !incomingName ? extractToolNameFromArguments(nextArguments) : "";
     existing[index] = {
       ...current,
-      id: delta.id ?? current.id,
+      // 真值判定而非 ??：Responses 流的 arguments.delta/done 帧 id 取自 item_id/call_id，
+      // 帧上两者皆缺时为 ""——?? 会让空串覆盖 output_item.added 已写入的真 call_id，
+      // 续传的 function_call/function_call_output 配对 id 全变空（火山等严格端点 400）。
+      id: delta.id || current.id,
       type: delta.type ?? current.type,
       function: {
         name: incomingName || currentName || inferredName,
@@ -1601,6 +1682,7 @@ export async function readOpenAiResponseIntoMessage(
   response: Response,
   hooks: StreamHooksWithSink,
   signal?: AbortSignal,
+  assistant?: Assistant,
 ) {
   const toolCalls: any[] = [];
   const contentType = response.headers.get("content-type") ?? "";
@@ -1611,14 +1693,14 @@ export async function readOpenAiResponseIntoMessage(
 
   if (contentType.includes("text/event-stream")) {
     content = await readOpenAiStream(response, (delta, rawEvent) => {
-      const applied = applyOpenAiDelta(delta, rawEvent, hooks, toolCalls);
+      const applied = applyOpenAiDelta(delta, rawEvent, hooks, toolCalls, assistant);
       reasoning += applied.reasoning;
       return applied;
     }, signal);
   } else {
     rawText = await response.text();
     if (/^\s*data:/m.test(rawText)) {
-      const streamed = readOpenAiSseTextIntoMessage(rawText, hooks, toolCalls);
+      const streamed = readOpenAiSseTextIntoMessage(rawText, hooks, toolCalls, assistant);
       content = streamed.content;
       reasoning = streamed.reasoning;
       return { content, reasoning, toolCalls, rawText, raw };
@@ -1654,7 +1736,8 @@ export async function readOpenAiResponseIntoMessage(
         } else if (itemType === "function_call") {
           mergeToolCallDeltas(toolCalls, [{
             index: toolCalls.length,
-            id: String(item.call_id ?? item.id ?? ""),
+            // 同流式路径:call_id 优先(工具调用配对 id),item.id 仅缺失时兜底。
+            id: String(item.call_id || item.id || ""),
             type: "function",
             function: { name: String(item.name ?? ""), arguments: String(item.arguments ?? "{}") },
           }], "snapshot");
@@ -1704,12 +1787,13 @@ export async function fetchOpenAiTextStreaming(
       headers: requestBody.stream === false ? headers : { ...headers, Accept: "text/event-stream" },
       body: JSON.stringify(requestBody),
       signal: sig,
+      // Bun timeout 由 net.ts fetch 拦截器统一注入 timeout:0(见 Claude 适配器处注释)。
     }),
     // R3-1:头超时统一 600s(原 OpenAI 自建包装,现下沉为骨架能力;用户需求 2026-08-01:
     // 非流式从 300s 对齐流式 600s——非流式响应头要等全文生成完,长思考模型误杀风险更高)。
     headerTimeoutMs: () => 600_000,
     async readRound(response, sig) {
-      const r = await readOpenAiResponseIntoMessage(response, hooks, sig);
+      const r = await readOpenAiResponseIntoMessage(response, hooks, sig, assistant);
       // 稀疏数组洞与无名条目过滤:Responses API 流按 output_index 建槽,function_call 与
       // web_search_call 混发时索引不连续产生 undefined 洞(gpt-5.5 + web_search 崩溃 bug);
       // web_search_call 由 OpenAI 服务端执行,无需本地工具往返,跳过即正确行为。无名条目是
@@ -1719,10 +1803,16 @@ export async function fetchOpenAiTextStreaming(
       for (const toolCall of r.toolCalls) {
         if (!toolCall || typeof toolCall !== "object") continue;
         if (!toolCall.function?.name) continue;
+        // 兜底须覆盖空串（?? 只接 null/undefined）：流帧的 id 恒经 String(… ?? "")
+        // 归一，缺失时是 "" 而非 undefined，旧写法会把空串原样放行，续传配对
+        // call_id 全空（严格端点 400）。
+        const rawId = String(toolCall.id ?? "").trim();
         normalized.push({
-          id: String(toolCall.id ?? id()),
+          id: rawId || id(),
           name: String(toolCall.function?.name ?? ""),
-          arguments: String(toolCall.function?.arguments ?? "{}"),
+          // 同 id 的空串问题:arguments 缺失时流帧给的是 ""(不是 undefined),?? 接不住。
+          // 归一到 "{}" —— 空串既非合法 JSON、也过不了严格端点的必填校验。
+          arguments: toolArgumentsJson(toolCall.function?.arguments),
         });
       }
       return { text: r.content, toolCalls: normalized, replay: r };
@@ -1736,19 +1826,23 @@ export async function fetchOpenAiTextStreaming(
           toolName: call.name,
           input: call.arguments,
           output,
-          approvalState: initialApprovalState(call.name, assistant),
+          approvalState: initialApprovalState(call.name, assistant, hooks.conversation),
         };
         return useResponseInput
-          ? { type: "function_call_output", call_id: call.id, output: resolvedToolOutput(toolPart) }
-          : { role: "tool", tool_call_id: call.id, content: resolvedToolOutput(toolPart) };
+          ? { type: "function_call_output", call_id: call.id, output: toolResultTextForApi(toolPart) }
+          : { role: "tool", tool_call_id: call.id, content: toolResultTextForApi(toolPart) };
       });
       if (useResponseInput) {
-        messages = [...messages, ...responseApiToolCallItems(r.toolCalls), ...toolMessages];
+        // 用归一化密集数组（与 toolMessages 的 call.id 同源，配对恒成立；勿用 r.toolCalls
+        // 原始稀疏数组——洞会序列化成 input 的 null 项，见 responseApiToolCallItems 头注）。
+        messages = [...messages, ...responseApiToolCallItems(result.toolCalls), ...toolMessages];
         return { ...body, input: messages, stream: true };
       }
       messages = [
         ...messages,
-        compactAssistantToolMessage(r.content, r.toolCalls, r.reasoning || reasoningFromParts(hooks.message?.parts ?? [])),
+        // 同 responses 分支纪律:用归一化密集数组(见回放纪律节注),不规范中转跳号
+        // 建槽的洞不得进 tool_calls。
+        compactAssistantToolMessage(r.content, chatToolCallsFromNormalized(result.toolCalls), r.reasoning || reasoningFromParts(hooks.message?.parts ?? [])),
         ...toolMessages,
       ];
       return { ...body, messages, stream: true };

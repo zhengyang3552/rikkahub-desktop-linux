@@ -76,6 +76,9 @@
     "save_failed": "保存失败",
     "autosaving": "正在自动保存...",
     "autosaved": "已自动保存",
+    "autosave_failed": "自动保存失败",
+    "autosave_failed_named": "自动保存{{name}}失败",
+    "autosave_failed_retry": "保存失败,点击重试",
     "delete": "删除",
     "hide_key": "隐藏 API Key",
     "show_key": "显示 API Key"
@@ -97,6 +100,14 @@
     "quit_app_hint": "关闭窗口并结束后台进程。",
     "quit_app_button": "退出",
     "quit_failed": "退出失败",
+    "shell_title": "终端(bash)",
+    "shell_path": "自定义 bash 路径",
+    "shell_path_placeholder": "留空则自动探测(系统 Git Bash 或内置终端)",
+    "shell_path_hint": "AI 执行命令所用的 bash。留空自动探测;自动探测失败时,可在此指定 bash.exe 的完整路径(如 Cygwin/MSYS2)。",
+    "shell_path_invalid": "路径无效:请指向存在的 bash.exe",
+    "shell_recheck": "重新检测",
+    "shell_recheck_ok": "检测成功,bash 已可用",
+    "shell_recheck_fail": "仍未找到可用的 bash",
     "opt": {
       "show_user_avatar": "显示用户头像",
       "show_assistant_bubble": "显示助手气泡",
@@ -165,6 +176,7 @@
     "query": "查询",
     "balance_api_path": "余额 API Path",
     "balance_result_path": "余额结果路径",
+    "balance_result_path_invalid": "表达式无效。支持路径（如 data.total_credits、list[0]）与 + - * / ++ 运算。",
     "test_summary": "测试摘要",
     "test_summary_model": "模型：{{model}}",
     "testing": "正在测试...",
@@ -411,7 +423,7 @@
     "no_request_body": "无请求体记录",
     "no_response_body": "无响应体记录",
     "clear": "清空日志",
-    "clear_confirm": "确定清空所有请求日志?此操作不可撤销。",
+    "clear_confirm": "确定清空当前显示的日志?此操作不可撤销。",
     "cleared": "已清空所有请求日志",
     "field_time": "时间",
     "field_method": "方法",
@@ -476,6 +488,11 @@
     "variables_label": "变量：",
     "reset_default": "恢复默认",
     "done": "完成",
+    "compress_engine": {
+      "chat": "对话引擎",
+      "pi": "工作区引擎 (pi)",
+      "pi_note": "工作区引擎使用 pi 原生压缩机制，此提示词随引擎内置、不可编辑。增量更新与超大回合另有同机制的专用变体。"
+    },
     "prompt": {
       "title": "标题生成 Prompt",
       "translate": "翻译 Prompt",
@@ -530,6 +547,7 @@
   "mcp": {
     "title": "MCP 与拓展",
     "subtitle": "管理 MCP 服务器、提示词注入、世界书、快捷消息与 Agent Skills。",
+    "no_assistants": "暂无可配置的助手。请先在「助手」分区创建一个助手，再回到这里进行配置。",
     "tab": {
       "mode": "提示词注入",
       "lorebook": "世界书",
@@ -637,6 +655,8 @@
     "skill_imported": "Skill 已导入：{{name}}",
     "import_failed": "导入失败",
     "empty_skill": "还没有 Skill",
+    "skill_issues_title": "规范化检查",
+    "skill_unavailable_hint": "缺少 description，AI 引擎不会加载该技能（在 SKILL.md 的 frontmatter 中补上即可）",
     "delete_skill_confirm": "删除这个 Skill？",
     "import_github": "从 GitHub 导入",
     "github_url_ph": "https://github.com/owner/repo 或 /tree/branch/sub/path",
@@ -868,7 +888,8 @@
       "hygiene_installers_cleaned": "数据目录清理：移除 {{count}} 个过时的更新安装包残留",
       "hygiene_legacy_snapshot_cleaned": "数据目录清理：移除旧版迁移遗留快照",
       "orphan_stats": "附件目录统计：{{orphans}} 个条目已无引用，约 {{orphanMb}} MB；另有 {{untracked}} 个无记录文件，约 {{untrackedMb}} MB。不会自动删除，如需清理请先备份",
-      "hygiene_failed": "数据目录清理任务失败，不影响运行，下次启动重试"
+      "hygiene_failed": "数据目录清理任务失败，不影响运行，下次启动重试",
+      "output_limit_unknown": "模型 {{model}} 的最大输出长度未知，已按保守默认 {{fallback}} 发送。若该模型报「max_tokens 非法」，请在助手设置里手动指定最大输出长度"
     }
   },
   "model_edit": {

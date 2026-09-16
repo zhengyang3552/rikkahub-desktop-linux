@@ -15,6 +15,7 @@ import { Switch } from "~/components/ui/switch";
 import { Textarea } from "~/components/ui/textarea";
 import { UIAvatar } from "~/components/ui/ui-avatar";
 import { useAutosaveDraft } from "~/hooks/use-autosave-draft";
+import { AutosaveStatusRow } from "~/components/settings/autosave-status";
 import api from "~/services/api";
 import { confirmDialog } from "~/stores/confirm-store";
 import type { AssistantProfile, ProviderModel, Settings } from "~/types";
@@ -127,8 +128,12 @@ export function AssistantsSection({
   };
 
   const addAssistant = async () => {
+    // issue #49 连带:assistants 意外为空时 clone(undefined) 会 throw(JSON.parse(undefined)),
+    // 把"新建助手"这条自愈路径堵死。模板缺省给最小合法体(tags 是唯一未被下方显式覆盖的
+    // 必填字段):后端 detail 接口以 defaultAssistant() 展开兜底,其余缺省由服务端补全。
+    const template = settings.assistants[0] as AssistantProfile | undefined;
     const created = {
-      ...clone(settings.assistants[0]),
+      ...(template ? clone(template) : { tags: [] }),
       id: crypto.randomUUID(),
       name: t("settings:assistants.new_assistant_name"),
       avatar: { type: "dummy" },
@@ -354,7 +359,7 @@ export function AssistantsSection({
             />
             {/* 专题11-P0:秒级时间变量每次请求都变,提示词前缀缓存全灭,就地提醒改天级 */}
             {/\{\{\s*(cur_time|cur_datetime|time)\s*\}\}/.test(textValue(draft.systemPrompt)) ? (
-              <p className="text-xs text-amber-600 dark:text-amber-500">
+              <p className="text-xs text-warning">
                 {t("settings:assistants.system_prompt_cache_hint")}
               </p>
             ) : null}
@@ -914,7 +919,10 @@ export function AssistantsSection({
               <Trash2 className="size-4" />
               {t("settings:assistants.delete")}
             </Button>
-            <div className="flex items-center px-2 text-xs text-muted-foreground">{t("settings:assistants.autosaved")}</div>
+            <AutosaveStatusRow
+              status={autosave.status}
+              onRetry={() => void autosave.saveNow()}
+            />
           </div>
         </div>
       </div>

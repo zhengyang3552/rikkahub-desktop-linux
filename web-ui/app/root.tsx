@@ -17,7 +17,7 @@ import "./app.css";
 import "./i18n";
 import { Toaster } from "./components/ui/sonner";
 import { ThemeProvider } from "./components/theme-provider";
-import { TitleBar } from "./components/title-bar";
+import { TooltipProvider } from "./components/ui/tooltip";
 import { UpdateDialog, type UpdateInfo } from "./components/update-dialog";
 import { WebAuthGate } from "./components/web-auth-gate";
 import { StartupGate } from "./components/startup-gate";
@@ -33,6 +33,7 @@ import { toast } from "sonner";
 import { GlobalConfirmDialog } from "./components/global-confirm-dialog";
 import { useAppErrorsStore } from "./stores/app-errors-store";
 import { startUsageActivityBeacon } from "./services/usage-activity";
+import { useApprovalNotifications } from "./lib/approval-notification";
 import api from "~/services/api";
 
 const queryClient = new QueryClient();
@@ -190,6 +191,8 @@ function AppContent() {
   useSettingsSubscription();
   useMemorySubscription();
   useAppErrorsSubscription();
+  // 域4-1(交互审查 2A):审批等待的桌面通知(窗口不可见时),琥珀点外显在侧栏/标签条。
+  useApprovalNotifications();
   useHotkeys();
   const displaySetting = useSettingsStore((state) => state.settings?.displaySetting);
   // 专题8:界面语言权威在后端 displaySetting.language(localStorage 按 origin 隔离,
@@ -233,8 +236,11 @@ function AppContent() {
     ).trim();
     const uiCjk = String(displaySetting?.uiFontFamilyCjkCss ?? "").trim();
     const chatCjk = String(displaySetting?.chatFontFamilyCjkCss ?? "").trim();
+    // 默认(跟随系统)= var(--font-sans):即 NewMax 默认链(Inter Variable 起链,
+    // 中文由链内 Noto Sans SC Variable 兜底)。曾把 Noto Sans SC/微软雅黑 排链首,
+    // 拉丁字形永远命中中文字体、轮不到 Inter,英文观感与 NewMax 不符(G10)。
     const uiFont = composeFontChain(
-      uiEn || '"Noto Sans SC", "Microsoft YaHei", var(--font-sans)',
+      uiEn || "var(--font-sans)",
       UI_CJK_OVERRIDE_FAMILY,
       Boolean(uiCjk),
     );
@@ -335,7 +341,9 @@ function AppContent() {
 
   return (
     <ThemeProvider defaultTheme="light">
-      <TitleBar />
+      {/* G7 全局 Tooltip 配置:500ms 出场延迟,300ms 内连续悬停免延迟(浏览器原生手感)。
+          sidebar 子树内嵌的 Provider(0ms)就近覆盖,不受影响。 */}
+      <TooltipProvider delayDuration={500} skipDelayDuration={300}>
       {/* 路由切换即时呈现,不做过渡动画(专题1 B 族终案):AnimatePresence mode="wait" 的
           串行动画(旧页淡出→新页淡入)必然穿越空白帧,在整页切换场景被感知为闪动;
           成熟桌面应用的主区域切换均为即时切换 —— React 单次提交内旧页换新页,
@@ -347,6 +355,7 @@ function AppContent() {
       <Toaster position="top-center" />
       <GlobalConfirmDialog />
       <SilentUpdateChecker />
+      </TooltipProvider>
     </ThemeProvider>
   );
 }

@@ -9,6 +9,7 @@ import type { JsonValue } from "../foundation/types";
 import type { Settings } from "../foundation/types/settings";
 import { isRecord, safeJsonStringify } from "../foundation/utils";
 import { dataDir, filesDir, skillsDir } from "../foundation/paths";
+import { isWindowsReservedName } from "../foundation/windows-names";
 import { reportError } from "../observability/app-errors";
 import { tempDir } from "../foundation/platform";
 import { state } from "../persistence/json-store";
@@ -17,6 +18,7 @@ import { DEFAULT_ASSISTANT_ID, exportPcConversationsDump, flushConvDirtyNow, get
 import { listAllConversationMetas } from "../conversations/read-queries";
 import { collectPcFileRefs, hashFileSha256 } from "./file-refs";
 import { createZipFromDirectory } from "./zip";
+import { adaptWorkspaceToolPartForAndroid } from "./workspace-android-export";
 import androidSchemaV24 from "./android-schema-v24.json";
 import { exportSkills } from "../tools";
 
@@ -193,6 +195,9 @@ export function rewriteAvatarsInSettings(settings: any, mapping: Record<string, 
     delete copy.proxyConfig;
     delete copy.preferredPort;
     delete copy.keybindings;
+    // shellPath 是机器级 bash 绝对路径,PC→APP/跨机恢复无意义;带到目标机反而因路径不存在
+    // 锁死 bash(getShellConfig 对不存在的 customShellPath 抛错),故剥离,目标机走自动探测。
+    delete copy.shellPath;
     // 专题3 S-1(机制,详见 filterSearchServicesForAndroid):PC-only 搜索服务过滤 +
     // 选中下标修正;全被过滤时删键,让安卓走自身默认值(避免空列表越界)。
     if (Array.isArray(copy.searchServices)) {
@@ -262,8 +267,9 @@ export function filterMessagePartsForAndroid(
 }
 
 /** PC-only 消息注解判别符(安卓 UIMessageAnnotation 只有 url_citation;PC 生成失败时
- *  写入的 model_call_error 若流入安卓即"会话打不开")。 */
-export const PC_ONLY_ANNOTATION_TYPES: ReadonlySet<string> = new Set(["model_call_error"]);
+ *  写入的 model_call_error 若流入安卓即"会话打不开")。pi-fidelity 是 P7 引擎消息
+ *  保真注解(块结构/思维链签名),纯 PC 工作区语义,同样不得流入安卓。 */
+export const PC_ONLY_ANNOTATION_TYPES: ReadonlySet<string> = new Set(["model_call_error", "pi-fidelity", "compaction_boundary"]);
 
 /** A-2:导出方向的注解清洗。只保留"带字符串判别符且非 PC-only"的注解——缺判别符的
  *  遗留脏对象与 PC-only 类型都会让安卓多态解码即炸;安卓自有/未来新增类型原样透传。 */
@@ -514,12 +520,16 @@ function insertConversationsIntoDb(db: InstanceType<typeof Database>, backupName
           const toInstant = (v: any) => typeof v === "string" && v && !v.endsWith("Z") && !/[+-]\d{2}:\d{2}$/.test(v) ? v + "Z" : v;
           const fixParts = (parts: any[]) => parts.map((p: any) => {
             if (!p || typeof p !== "object") return p;
-            const fixed = { ...p };
+            let fixed = { ...p };
             if (fixed.createdAt) fixed.createdAt = toInstant(fixed.createdAt);
             if (fixed.finishedAt) fixed.finishedAt = toInstant(fixed.finishedAt);
-            // 安卓对齐批6(审查A P0):无判别符工具载荷包装成 text part,详见 wrapToolOutputEntriesForAndroid。
-            if (fixed.type === "tool" && Array.isArray(fixed.output)) {
-              fixed.output = wrapToolOutputEntriesForAndroid(fixed.output);
+            if (fixed.type === "tool") {
+              // M3-2(§9.1B 增强层):pi 形状 → 安卓 workspace_* 原生形状,换原生 diff/终端卡渲染。
+              fixed = adaptWorkspaceToolPartForAndroid(fixed);
+              // 安卓对齐批6(审查A P0):无判别符工具载荷包装成 text part,详见 wrapToolOutputEntriesForAndroid。
+              if (Array.isArray(fixed.output)) {
+                fixed.output = wrapToolOutputEntriesForAndroid(fixed.output);
+              }
             }
             return fixed;
           });
@@ -645,8 +655,9 @@ type UploadStagingPlan = {
 // 截干保尾缀(staging 与解包都落真实文件系统,常见上限 255 字节,150 字符对多字节留足余量)。
 // 清洗后为空由调用方回退 <id>.<ext>;清洗后撞名由调用方 usedNames 去重兜底。
 export function sanitizeStagingFileName(rawName: string): string {
-  let name = rawName.replace(/[<>:"/\\|?*# -]/g, "_").replace(/[. ]+$/, "");
-  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i.test(name)) name = `_${name}`;
+  let name = rawName.replace(/[<>:"/\\|?*#\x00-\x1f]/g, "_").replace(/[. ]+$/, "");
+  // 设备保留名判定单源于 foundation/windows-names(问题4);此处"加 _ 前缀"的清洗行为冻结。
+  if (isWindowsReservedName(name)) name = `_${name}`;
   if (name.length > 150) {
     const ext = extname(name);
     name = name.slice(0, 150 - ext.length) + ext;
@@ -716,7 +727,15 @@ function buildUploadStagingPlan(): UploadStagingPlan {
   return { copies, backupNameById, totalFiles: state.files.length, missingSkipped, orphanSkipped, dedupedCount };
 }
 
-export function createSettingsBackupZipToPath(targetZipPath: string, onProgress?: (message: string) => void): number {
+/** B4-①:导出返回值。size=zip 字节数;warnings=关键降级项(安卓库失败/附件暂存失败),
+ *  经 X-Export-Warnings header 透出给前端显式 toast——用户必须知道"备份成功了但缺会话库"。 */
+export interface BackupExportResult {
+  size: number;
+  warnings: string[];
+}
+
+export function createSettingsBackupZipToPath(targetZipPath: string, onProgress?: (message: string) => void): BackupExportResult {
+  const warnings: string[] = [];
   const tmpRoot = join(tempDir(), `rikkahub-backup-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   const stageDir = join(tmpRoot, "stage");
   mkdirSync(stageDir, { recursive: true });
@@ -773,10 +792,14 @@ export function createSettingsBackupZipToPath(targetZipPath: string, onProgress?
           writeFileSync(join(stageDir, "rikka_hub-shm"), Buffer.alloc(0));
         } else {
           if (existsSync(dbPath)) try { rmSync(dbPath); } catch { /* */ }
+          // B4-①:rikka_hub.db 是 PC→APP 会话的唯一载体,失败=该备份恢复后无会话。分级降级:
+          // zip 仍产出(PC→PC 走 pc_conversations.db 不受影响),但记 warning 让前端显式告知。
+          warnings.push("对话数据库(rikka_hub.db)生成失败，本备份恢复到移动端将不含会话");
         }
       } catch (dbErr) {
         console.error("[backup] generateRikkaHubDb failed:", dbErr);
         if (existsSync(dbPath)) try { rmSync(dbPath); } catch { /* */ }
+        warnings.push("对话数据库(rikka_hub.db)生成失败，本备份恢复到移动端将不含会话");
       }
     }
     if (uploadPlan.copies.length > 0) {
@@ -785,6 +808,8 @@ export function createSettingsBackupZipToPath(targetZipPath: string, onProgress?
       const stageResult = stageUploadFilesInto(uploadStage, uploadPlan.copies, onProgress);
       if (stageResult.failed > 0) {
         reportError("backup", "error", `${stageResult.failed}/${uploadPlan.copies.length} 个附件暂存失败，备份不完整；首个错误：${stageResult.firstError}`, undefined, "staging_failed", { failed: stageResult.failed, total: uploadPlan.copies.length, firstError: stageResult.firstError ?? "" });
+        // B4-①:附件缺失属"备份不完整"的关键降级,同样透出给前端。
+        warnings.push(`${stageResult.failed}/${uploadPlan.copies.length} 个附件未能打进备份`);
       }
     }
     if (uploadPlan.missingSkipped > 0) {
@@ -799,6 +824,8 @@ export function createSettingsBackupZipToPath(targetZipPath: string, onProgress?
       mkdirSync(skillsStage, { recursive: true });
       copyDirRecursive(skillsDir, skillsStage);
     }
+    // P7:引擎会话状态(压缩记录)在会话行内,随 PC 库 dump 一体进备份——P5 的
+    // pi-sessions/ jsonl 打包段随层退役,备份面回归"库即全部"。
     // 安卓对齐批6:fonts/ 透传(安卓 2.4.2 新增自定义聊天字体)。PC 不消费,仅忠实搬运,
     // 保证 APP→PC→APP 往返不丢字体文件(导入侧对应 importFontsDirIfPresent)。
     const fontsDir = join(dataDir, "fonts");
@@ -817,7 +844,7 @@ export function createSettingsBackupZipToPath(targetZipPath: string, onProgress?
     if (!existsSync(targetZipPath)) {
       throw new Error("Zip file was not created (file missing after archiver exited 0)");
     }
-    return statSync(targetZipPath).size;
+    return { size: statSync(targetZipPath).size, warnings };
   } finally {
     try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
   }

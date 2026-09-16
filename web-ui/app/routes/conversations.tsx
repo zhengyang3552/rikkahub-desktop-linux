@@ -8,12 +8,12 @@ import {
   type ConversationQuickJumpItem,
 } from "~/components/conversation-quick-jump";
 import { ConversationSidebar } from "~/components/conversation-sidebar";
-import { useTheme } from "~/components/theme-provider";
 import { ConversationEmptyState } from "~/components/extended/conversation";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { ChatInput } from "~/components/input/chat-input";
 import { GlobalDropZone } from "~/components/global-drop-zone";
 import { ChatMessage } from "~/components/message/chat-message";
+import { CompactionDivider } from "~/components/message/compaction-divider";
 import { ShareExportDialog } from "~/components/message/share-export-dialog";
 import { RenameConversationDialog } from "~/components/rename-conversation-dialog";
 import { Button } from "~/components/ui/button";
@@ -37,44 +37,79 @@ import {
   SelectTrigger,
   SelectValue,
 } from "~/components/ui/select";
-import { SidebarInset, SidebarProvider, SidebarTrigger } from "~/components/ui/sidebar";
+import { SidebarInset, SidebarProvider, SidebarTrigger, useSidebar } from "~/components/ui/sidebar";
 import { useIsMobile } from "~/hooks/use-mobile";
+import { useAvailableCommands } from "~/hooks/use-available-commands";
 import { useConversationList } from "~/hooks/use-conversation-list";
 import { onHotkeyAction, type HotkeyBusAction } from "~/lib/hotkey-events";
 import { useCurrentAssistant } from "~/hooks/use-current-assistant";
-import { useCurrentModel } from "~/hooks/use-current-model";
-import { getAssistantDisplayName, getModelDisplayName } from "~/lib/display";
+import type { SlashCommandDto } from "~/lib/slash-commands";
 import {
   convertConversationToMarkdown,
-  downloadMarkdown,
   safeMarkdownFilename,
 } from "~/lib/export-markdown";
+import { exportTextFile } from "~/lib/export-file";
 import { refreshSettingsStore } from "~/lib/settings-sync";
 import { cn } from "~/lib/utils";
-import api from "~/services/api";
+import { isCompactionBoundaryMessage } from "~/lib/compaction";
+import api, { ApiError } from "~/services/api";
 import { useChatInputStore } from "~/stores";
 import {
   evictConversations,
   useConversationEntry,
   useConversationStore,
 } from "~/stores/conversation-store";
-import { ensureFullConversationDetail, loadOlderConversationNodes, refreshConversation, useConversationSubscription } from "~/stores/conversation-stream";
+import {
+  ensureFullConversationDetail,
+  loadOlderConversationNodes,
+  refreshConversation,
+  setConversationStreamAttention,
+  useConversationSubscription,
+} from "~/stores/conversation-stream";
 import { WorkbenchHost } from "~/components/workbench/workbench-host";
+import { ContainerPlusMenu } from "~/components/workspace/container-plus-menu";
+import { ContainerTabBar } from "~/components/workspace/container-tab-bar";
+import { WindowControlsBar } from "~/components/window-controls";
+import { ConversationTabStrip } from "~/components/workspace/conversation-tab-strip";
+import { EngineStatusBar } from "~/components/workspace/engine-status-bar";
+import { PaneContainerProvider } from "~/components/workspace/pane-container-context";
+import { WorkspaceEmptyState } from "~/components/workspace/workspace-empty-state";
+import { useCompressStore, useConversationCompressing } from "~/stores/compress-store";
+import { useWorkspaceStore } from "~/stores/workspace-store";
+import {
+  CHAT_CONTAINER,
+  MAX_PANES,
+  flattenColumns,
+  groupSiblingOf,
+  type ContainerKey,
+  type PaneColumn,
+  useContainerTabsStore,
+} from "~/stores/container-tabs-store";
+import { useTabDragStore } from "~/stores/tab-drag-store";
 import {
   useWorkbench,
   useWorkbenchController,
   WorkbenchProvider,
 } from "~/components/workbench/workbench-context";
 import {
+  type ConversationListDto,
   type MessageNodeDto,
   type MessageDto,
   type ProviderModel,
   type Settings,
   type UIMessagePart,
 } from "~/types";
-import { ArrowDown, Check, ListChecks, Loader2, MessageSquare, Moon, Pencil, Sun, X } from "lucide-react";
-import Logo from "~/components/logo";
-import type { PanelImperativeHandle } from "react-resizable-panels";
+import {
+  ArrowDown,
+  Check,
+  ListChecks,
+  Loader2,
+  MessageSquare,
+  Pencil,
+  X,
+} from "lucide-react";
+import { EmptyGreeting } from "~/components/empty-greeting";
+import type { GroupImperativeHandle, PanelImperativeHandle } from "react-resizable-panels";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { v4 as uuidv4 } from "uuid";
@@ -123,7 +158,11 @@ function ConversationSystemPromptButton({
         onClick={() => setExpanded((current) => !current)}
       >
         <Pencil className="size-3.5" />
-        <span>{hasCustomPrompt ? t("conversations.custom_prompt.button_active") : t("conversations.custom_prompt.button")}</span>
+        <span>
+          {hasCustomPrompt
+            ? t("conversations.custom_prompt.button_active")
+            : t("conversations.custom_prompt.button")}
+        </span>
       </Button>
       {expanded ? (
         <div className="mt-2 w-full max-w-3xl space-y-2">
@@ -167,6 +206,10 @@ const EMPTY_SUGGESTIONS: string[] = [];
 const VirtuosoListPadding = () => <div className="h-4" />;
 const VIRTUOSO_COMPONENTS = { Header: VirtuosoListPadding, Footer: VirtuosoListPadding };
 const COMPRESS_TOKEN_OPTIONS = [500, 1000, 2000, 4000];
+// 工作台面板宽度(占横向组宽的百分比)。注意 react-resizable-panels v4 的数字按像素
+// 解析,百分比必须传字符串(如 "36%")。
+const WORKBENCH_DEFAULT_WIDTH_PCT = 36;
+const WORKBENCH_MIN_WIDTH_PCT = 20;
 const COMPRESS_KEEP_OPTIONS = [0, 16, 32, 64];
 const TRANSLATION_LANGUAGES = [
   { value: "zh-CN" },
@@ -192,27 +235,12 @@ interface EditingSession {
   textPartIndex: number | null;
 }
 
-function ThemeToggleButton() {
-  const { theme, setTheme } = useTheme();
-  const { t } = useTranslation("page");
-  // Resolve "system" to a concrete light/dark, so the toggle always lands on the opposite mode.
-  const isDark =
-    theme === "dark" ||
-    (theme === "system" &&
-      typeof window !== "undefined" &&
-      window.matchMedia?.("(prefers-color-scheme: dark)").matches);
-  return (
-    <Button
-      type="button"
-      variant="ghost"
-      size="icon-sm"
-      onClick={() => setTheme(isDark ? "light" : "dark")}
-      aria-label={isDark ? t("conversations.theme_toggle.to_light") : t("conversations.theme_toggle.to_dark")}
-      title={isDark ? t("conversations.theme_toggle.to_light") : t("conversations.theme_toggle.to_dark")}
-    >
-      {isDark ? <Moon className="size-4" /> : <Sun className="size-4" />}
-    </Button>
-  );
+// 侧栏收起(offcanvas 全隐)或移动端时,正文列顶行需要一个展开入口;
+// 常态下折叠按钮在侧栏头部(前端重构A1,明暗切换同步迁往侧栏底部)。
+function CollapsedSidebarTrigger() {
+  const { isMobile, state } = useSidebar();
+  if (!isMobile && state !== "collapsed") return null;
+  return <SidebarTrigger className="pointer-events-auto relative z-50 mb-1" />;
 }
 
 function createHomeDraftId() {
@@ -410,8 +438,8 @@ function buildEditedParts(session: EditingSession, draftParts: UIMessagePart[]):
   return [...preservedParts, ...appendedAttachments];
 }
 
-
 function useDraftInputController({
+  container,
   activeId,
   isHomeRoute,
   homeDraftId,
@@ -420,6 +448,8 @@ function useDraftInputController({
   navigate,
   refreshList,
 }: {
+  /** 本列所属容器:新会话的归属(workspaceId)由它决定,不读全局激活容器。 */
+  container: ContainerKey;
   activeId: string | null;
   isHomeRoute: boolean;
   homeDraftId: string;
@@ -429,9 +459,9 @@ function useDraftInputController({
   refreshList: () => void;
 }) {
   const draftKey = activeId ?? (isHomeRoute ? homeDraftId : null);
-  // 刻意不在这里订阅 drafts[draftKey] 的内容:本 hook 由 ConversationsPageInner 调用,
-  // 一旦订阅草稿,每次打字都会让整个巨型组件(侧边栏/对话框/面板组)一起重渲染,造成
-  // 输入卡顿。草稿内容订阅下沉到 ChatInputArea——只有输入区随打字重渲染。
+  // 刻意不在这里订阅 drafts[draftKey] 的内容:一旦订阅草稿,每次打字都会让整个窗格
+  // (消息列表/对话框/工具条)一起重渲染,造成输入卡顿。草稿内容订阅下沉到
+  // ChatInputArea——只有输入区随打字重渲染。
   const setDraftText = useChatInputStore((state) => state.setText);
   const addDraftParts = useChatInputStore((state) => state.addParts);
   const getSubmitParts = useChatInputStore((state) => state.getSubmitParts);
@@ -455,8 +485,15 @@ function useDraftInputController({
     // Send the message BEFORE setting activeId so the detail fetcher doesn't race
     // (`POST /messages` calls ensureConversation on the server; only then does the
     // subsequent `GET /api/conversations/{id}` succeed).
-    await api.post<{ status: string }>(`conversations/${conversationId}/messages`, { parts });
+    // 双层标签(M2-1):新会话归属发起它的那一列的容器——工作区容器时把 workspaceId
+    // 一并送给 ensureConversation,服务端据此挂载工作区工具与提示词段。并排后必须用
+    // 列的容器而不是全局激活容器,否则在非聚焦列发第一句会挂到邻列的工作区上。
+    await api.post<{ status: string }>(
+      `conversations/${conversationId}/messages`,
+      container !== CHAT_CONTAINER ? { parts, workspaceId: container } : { parts },
+    );
     clearDraft(draftKey);
+    useContainerTabsStore.getState().openConversation(container, conversationId);
 
     setActiveId(conversationId);
     navigate(`/c/${conversationId}`);
@@ -464,6 +501,7 @@ function useDraftInputController({
   }, [
     activeId,
     clearDraft,
+    container,
     draftKey,
     getSubmitParts,
     navigate,
@@ -519,6 +557,8 @@ interface ChatInputAreaProps {
   onStop?: () => Promise<void> | void;
   onExportConversation?: (includeReasoning: boolean) => void;
   onCompressConversation?: () => void;
+  slashCommands?: SlashCommandDto[];
+  onSlashCommand?: (name: string, argument: string) => Promise<boolean | void> | boolean | void;
   getOptimizeContext?: () => string;
 }
 
@@ -535,6 +575,8 @@ const ChatInputArea = React.memo(function ChatInputArea({
   onStop,
   onExportConversation,
   onCompressConversation,
+  slashCommands,
+  onSlashCommand,
   getOptimizeContext,
 }: ChatInputAreaProps) {
   const setText = useChatInputStore((state) => state.setText);
@@ -587,6 +629,8 @@ const ChatInputArea = React.memo(function ChatInputArea({
       onStop={onStop}
       onExportConversation={onExportConversation}
       onCompressConversation={onCompressConversation}
+      slashCommands={slashCommands}
+      onSlashCommand={onSlashCommand}
       getOptimizeContext={getOptimizeContext}
     />
   );
@@ -639,7 +683,9 @@ const QuickJumpOverlay = React.forwardRef<
     : isAtTop
       ? 0
       : Math.round((range.start + range.end) / 2);
-  return <ConversationQuickJump items={items} activeIndex={activeIndex} onItemClick={onItemClick} />;
+  return (
+    <ConversationQuickJump items={items} activeIndex={activeIndex} onItemClick={onItemClick} />
+  );
 });
 
 const ConversationTimeline = React.memo(
@@ -806,6 +852,13 @@ const ConversationTimeline = React.memo(
       isAtBottomRef.current = atBottom;
       setIsAtBottom(atBottom);
     }, []);
+    // 流式注意力上报:贴底观看当前会话 -> 增量逐帧落地;滚离底部/切会话/卸载 -> 攒批
+    // 250ms(根治"流式表格/大块时滚动看别处掉到十几帧",见 conversation-stream.ts)。
+    React.useEffect(() => {
+      if (!activeId || !isAtBottom) return;
+      setConversationStreamAttention(activeId);
+      return () => setConversationStreamAttention(null);
+    }, [activeId, isAtBottom]);
     const handleTotalListHeightChanged = React.useCallback((height: number) => {
       const previous = totalListHeightRef.current;
       totalListHeightRef.current = height;
@@ -856,9 +909,7 @@ const ConversationTimeline = React.memo(
     // 会话内分享: 点消息"分享"进入选择模式, 默认选中该消息及之前所有(对齐 APP).
     // 确认后弹出导出格式选择 (Markdown / 图片). 切换会话时清理, 避免残留选中态.
     const [shareSelecting, setShareSelecting] = React.useState(false);
-    const [shareSelectedIds, setShareSelectedIds] = React.useState<Set<string>>(
-      () => new Set(),
-    );
+    const [shareSelectedIds, setShareSelectedIds] = React.useState<Set<string>>(() => new Set());
     const [shareDialogOpen, setShareDialogOpen] = React.useState(false);
 
     const handleShare = React.useCallback(
@@ -1012,9 +1063,7 @@ const ConversationTimeline = React.memo(
     // "轮次条刚进来指第一轮,闪动后跳末轮"。播种值与 initialLocation 同源:无聚焦消息
     // = 末条+贴底;有聚焦消息 = 该条+非贴底。详情延迟到达(切换时列表为空、快照后才有
     // 消息)的场景在消息首次出现时补播种一次(wasEmpty 分支,同 knownIdsRef 第三条件)。
-    const scrollSeedRef = React.useRef<{ activeId: string | null; wasEmpty: boolean } | null>(
-      null,
-    );
+    const scrollSeedRef = React.useRef<{ activeId: string | null; wasEmpty: boolean } | null>(null);
     if (
       scrollSeedRef.current === null ||
       scrollSeedRef.current.activeId !== activeId ||
@@ -1141,7 +1190,11 @@ const ConversationTimeline = React.memo(
                 ? (modelById.get(message.modelId) ?? fallbackModel)
                 : fallbackModel;
               // I-2:index 携带 firstItemIndex 全局偏移,换算回已加载数组的本地下标
-              const isLastLoaded = index - nodesOffset === selectedNodeMessages.length - 1;
+              const localIndex = index - nodesOffset;
+              const isLastLoaded = localIndex === selectedNodeMessages.length - 1;
+              // 压缩发生点分割线:压缩完成时服务端在"当时的最新消息"上落
+              // compaction_boundary 注解,线画在该消息下方(两模式统一)。
+              const dividerBelow = isCompactionBoundaryMessage(message);
               return (
                 <div
                   id={getConversationMessageAnchorId(message.id)}
@@ -1170,6 +1223,7 @@ const ConversationTimeline = React.memo(
                     onToggleSelect={handleToggleSelect}
                     onShare={handleShare}
                   />
+                  {dividerBelow ? <CompactionDivider /> : null}
                 </div>
               );
             }}
@@ -1179,7 +1233,7 @@ const ConversationTimeline = React.memo(
         {!detailLoading && !detailError && activeId && selectedNodeMessages.length > 0 ? (
           <>
             {shareSelecting ? (
-              <div className="absolute bottom-4 left-1/2 z-20 flex -translate-x-1/2 items-center gap-1 rounded-full border bg-background/95 p-1 shadow-lg backdrop-blur">
+              <div className="absolute bottom-4 left-1/2 z-20 flex -translate-x-1/2 items-center gap-1 rounded-full border bg-background/95 p-1 shadow-lg">
                 <Button
                   variant="ghost"
                   size="icon"
@@ -1283,36 +1337,70 @@ export default function ConversationsPage() {
   );
 }
 
-function ConversationsPageInner() {
+// ===== 分栏:每列一份的会话视图 =====
+// 订阅/选择器/草稿/编辑态/三个会话级对话框全部收进本组件,以 conversationId 为参数——
+// 双栏/三栏 = 渲染多个实例。流订阅(entries 多路)与草稿(drafts 按会话键)天然隔离,
+// 打字/流式只重渲染所属列。页面层只保留侧栏、容器标签、热键、工作台等全局职责。
+// L 轮一级分栏:列 = (容器, 容器内窗格下标),故容器归属由 props 显式传入。
+
+type CurrentAssistantValue = ReturnType<typeof useCurrentAssistant>["currentAssistant"];
+
+interface ConversationPaneViewProps {
+  /** 本列所属容器(一级并排:同屏可有多个容器)。 */
+  container: ContainerKey;
+  /** 本列在所属容器内的窗格下标。 */
+  paneIndex: number;
+  /** 本列是否为聚焦列(路由/侧栏跟随它)。 */
+  focused: boolean;
+  /** 本列的会话:焦点列由路由权威(null = "新对话"态);非焦点列 = 窗格激活标签。 */
+  conversationId: string | null;
+  isHomeRoute: boolean;
+  homeDraftId: string;
+  setHomeDraftId: React.Dispatch<React.SetStateAction<string>>;
+  setActiveId: React.Dispatch<React.SetStateAction<string | null>>;
+  navigate: ReturnType<typeof useNavigate>;
+  refreshList: () => void;
+  settings: Settings | null;
+  conversations: ConversationListDto[];
+  activeWorkspace?: React.ComponentProps<typeof WorkspaceEmptyState>["workspace"];
+  currentAssistantId: ReturnType<typeof useCurrentAssistant>["currentAssistantId"];
+  currentAssistant: CurrentAssistantValue;
+  onRenameConversation: (conversationId: string, title: string) => Promise<void>;
+  onFocusPane: (container: ContainerKey, index: number) => void;
+}
+
+const ConversationPaneView = React.memo(function ConversationPaneView({
+  container,
+  paneIndex,
+  focused,
+  conversationId,
+  isHomeRoute,
+  homeDraftId,
+  setHomeDraftId,
+  setActiveId,
+  navigate,
+  refreshList,
+  settings,
+  conversations,
+  activeWorkspace,
+  currentAssistantId,
+  currentAssistant,
+  onRenameConversation,
+  onFocusPane,
+}: ConversationPaneViewProps) {
   const { t } = useTranslation("page");
-  const navigate = useNavigate();
-  const { id: routeId } = useParams();
-  const isHomeRoute = !routeId;
-  const isMobile = useIsMobile();
-  const { panel, closePanel } = useWorkbench();
+  const activeId = conversationId;
+  // 非聚焦列永远有会话(多窗格不变量:空窗格即收起),"新对话"态只属于聚焦列。
+  const paneIsHome = focused && isHomeRoute;
 
-  const { settings, assistants, currentAssistantId, currentAssistant } = useCurrentAssistant();
-  const { currentModel, currentProvider } = useCurrentModel();
-  const {
-    conversations,
-    activeId,
-    setActiveId,
-    loading,
-    error,
-    hasMore,
-    loadMore,
-    refreshList,
-  } = useConversationList({ currentAssistantId, routeId, autoSelectFirst: !isHomeRoute });
-
-  const [homeDraftId, setHomeDraftId] = React.useState(() => createHomeDraftId());
   const [editingSession, setEditingSession] = React.useState<EditingSession | null>(null);
   const [compressDialogOpen, setCompressDialogOpen] = React.useState(false);
   const [compressTargetTokens, setCompressTargetTokens] = React.useState(2000);
   const [compressKeepRecent, setCompressKeepRecent] = React.useState(32);
   const [compressAdditionalPrompt, setCompressAdditionalPrompt] = React.useState("");
-  const [compressing, setCompressing] = React.useState(false);
-  // R7-4:压缩可中途取消——中止本次请求;后端在落库前检查 request.signal,取消后不改写会话。
-  const compressAbortRef = React.useRef<AbortController | null>(null);
+  // 压缩状态全局化(compress-store):压缩是长任务,状态不随本组件卸载而丢——切页回来
+  // busy 互斥/spinner/取消句柄照常;取消语义(R7-4)不变,后端落库前查 request.signal。
+  const compressing = useConversationCompressing(activeId);
   const [translationDialogMessageId, setTranslationDialogMessageId] = React.useState<string | null>(
     null,
   );
@@ -1323,11 +1411,10 @@ function ConversationsPageInner() {
   const [systemPromptDialogOpen, setSystemPromptDialogOpen] = React.useState(false);
   const [systemPromptDraft, setSystemPromptDraft] = React.useState("");
 
-  // 订阅生命周期挂在顶层:会话打开即持流,与消息面板的条件渲染解耦
-  // (未来多标签页 = 每个页签容器各挂一份,同会话自动共享一条流)。
+  // 订阅生命周期挂在窗格顶层:窗格打开即持流,与消息面板的条件渲染解耦。
+  // 分栏 = 每窗格各挂一份,同会话自动共享一条流。
   useConversationSubscription(activeId);
-  // 顶层只用窄选择器取标量/稳定引用 —— zustand 按 Object.is 比较选择值,流式内容
-  // 增量期间这些值不变,顶层(侧边栏/顶栏/对话框)零重渲染(D 族根治的另一半)。
+  // 窄选择器取标量/稳定引用 —— 流式增量期间这些值不变,窗格壳零重渲染。
   const conversationAssistantId = useConversationStore((state) =>
     activeId ? (state.entries[activeId]?.detail?.assistantId ?? null) : null,
   );
@@ -1340,29 +1427,13 @@ function ConversationsPageInner() {
   const hasDetail = useConversationStore((state) =>
     activeId ? state.entries[activeId]?.detail != null : false,
   );
-  // 专题11-P1-3:本会话累计缓存命中率(已加载消息窗口内 cached/prompt 总和,取选中分支)。
-  // selector 直接归约成整数百分比:流式 chunk 不改 usage 时结果不变,顶层零重渲染;
-  // 无任何命中数据(厂商不回报)时返回 null,副标题该段隐藏。
-  const conversationCacheHitRate = useConversationStore((state) => {
-    const nodes = activeId ? state.entries[activeId]?.detail?.messages : undefined;
-    if (!nodes) return null;
-    let promptTotal = 0;
-    let cachedTotal = 0;
-    for (const node of nodes) {
-      const msg = node.messages[node.selectIndex] ?? node.messages[0];
-      const usage = msg?.usage as Record<string, unknown> | null | undefined;
-      if (!usage || typeof usage !== "object") continue;
-      // 本地估算的 usage 无缓存信息(cached 恒 0),计入会稀释命中率
-      if (usage.estimated === true) continue;
-      promptTotal += Number(usage.promptTokens ?? 0) || 0;
-      cachedTotal += Number(usage.cachedTokens ?? 0) || 0;
-    }
-    if (promptTotal <= 0 || cachedTotal <= 0) return null;
-    return Math.min(100, Math.round((cachedTotal / promptTotal) * 100));
-  });
-  // 节点增删才变(流式 chunk 只改节点内部),导出/压缩入口的可用性开关
   const hasMessages = useConversationStore((state) =>
     activeId ? (state.entries[activeId]?.detail?.messages.length ?? 0) > 0 : false,
+  );
+  // P5:工作区会话的手动压缩走 pi 原生 compaction(压引擎记忆,UI 历史不动)——
+  // 压缩框隐藏"目标 Token/保留最近消息"(那是 UI 历史压缩的参数),文案换语义。
+  const isWorkspaceConversation = useConversationStore((state) =>
+    activeId ? Boolean(state.entries[activeId]?.detail?.workspaceId) : false,
   );
   const detailLoading = useConversationStore((state) => {
     if (!activeId) return false;
@@ -1372,6 +1443,10 @@ function ConversationsPageInner() {
   const detailError = useConversationStore((state) =>
     activeId ? (state.entries[activeId]?.error ?? null) : null,
   );
+  const chatSuggestions =
+    useConversationStore((state) =>
+      activeId ? state.entries[activeId]?.detail?.chatSuggestions : undefined,
+    ) ?? EMPTY_SUGGESTIONS;
 
   const {
     draftKey,
@@ -1381,8 +1456,9 @@ function ConversationsPageInner() {
     clearCurrentDraft,
     getCurrentSubmitParts,
   } = useDraftInputController({
+    container,
     activeId,
-    isHomeRoute,
+    isHomeRoute: paneIsHome,
     homeDraftId,
     setHomeDraftId,
     setActiveId,
@@ -1390,22 +1466,17 @@ function ConversationsPageInner() {
     refreshList,
   });
 
-  const activeConversation = conversations.find((item) => item.id === activeId);
-  // 快照整体替换时才换引用;node_update 展开会话对象时该字段引用原样带过,流式期间稳定
-  const chatSuggestions =
-    useConversationStore((state) =>
-      activeId ? state.entries[activeId]?.detail?.chatSuggestions : undefined,
-    ) ?? EMPTY_SUGGESTIONS;
+  const activeConversationMeta = conversations.find((item) => item.id === activeId);
   const activeAssistantForConversation = React.useMemo(() => {
     const assistantId =
-      conversationAssistantId ?? activeConversation?.assistantId ?? currentAssistantId;
+      conversationAssistantId ?? activeConversationMeta?.assistantId ?? currentAssistantId;
     return (
       settings?.assistants.find((assistant) => assistant.id === assistantId) ??
       currentAssistant ??
       null
     );
   }, [
-    activeConversation?.assistantId,
+    activeConversationMeta?.assistantId,
     conversationAssistantId,
     currentAssistant,
     currentAssistantId,
@@ -1426,48 +1497,19 @@ function ConversationsPageInner() {
     systemPromptDialogOpen,
   ]);
 
-  React.useEffect(() => {
-    const base = t("conversations.meta.title");
-    document.title = activeConversation?.title ? `${activeConversation.title} - ${base}` : base;
-    return () => {
-      document.title = base;
-    };
-  }, [activeConversation?.title, t]);
-  const isNewChat = isHomeRoute && !activeId;
+  const isNewChat = paneIsHome && !activeId;
   const showSuggestions =
     Boolean(activeId) && !detailLoading && !detailError && chatSuggestions.length > 0;
   const displaySuggestions = showSuggestions ? chatSuggestions : EMPTY_SUGGESTIONS;
-
-  const handleSelect = React.useCallback(
-    (id: string, messageId?: string) => {
-      setActiveId(id);
-      // 搜索命中带 messageId 时通过 URL query 传给详情页,加载完成后滚到那条消息位置
-      // (对齐安卓);普通点击不带 messageId,维持原"进入会话滚底部"行为。
-      const target = messageId ? `/c/${id}?msg=${messageId}` : `/c/${id}`;
-      // 同会话也要 navigate 以更新 query(搜索当前会话的某条消息)
-      if (routeId !== id || messageId) {
-        navigate(target);
-      }
-    },
-    [navigate, routeId, setActiveId],
-  );
 
   React.useEffect(() => {
     setEditingSession(null);
   }, [activeId]);
 
-  const handleAssistantChange = React.useCallback(
-    async (assistantId: string) => {
-      await api.post<{ status: string }>("settings/assistant", { assistantId });
-      await refreshSettingsStore();
-      setActiveId(null);
-      if (routeId) {
-        navigate("/", { replace: true });
-      }
-      refreshList();
-    },
-    [navigate, refreshList, routeId, setActiveId],
-  );
+  /** 交互改路由前先聚焦本列(fork/新建等依赖"路由同步进聚焦列"的语义)。 */
+  const focusSelf = React.useCallback(() => {
+    useContainerTabsStore.getState().focusPane(container, paneIndex);
+  }, [container, paneIndex]);
 
   const handleToolApproval = React.useCallback(
     async (toolCallId: string, approved: boolean, reason: string, answer?: string) => {
@@ -1485,12 +1527,22 @@ function ConversationsPageInner() {
   const handleRegenerate = React.useCallback(
     async (messageId: string) => {
       if (!activeId) return;
-      await api.post<{ status: string }>(`conversations/${activeId}/regenerate`, {
-        messageId,
-      });
-      refreshList();
+      try {
+        await api.post<{ status: string }>(`conversations/${activeId}/regenerate`, {
+          messageId,
+        });
+        refreshList();
+      } catch (error) {
+        // 审计修复配套:压缩窗口内 regenerate 被服务端 409 挡下(写互斥,防压缩落库
+        // 覆盖吞消息)。按业务码查 i18n,后端 message 兜底——否则用户点了没反应。
+        const coded =
+          error instanceof ApiError && error.errorCode
+            ? t(`conversations.compress.error.${error.errorCode}`, { defaultValue: error.message })
+            : undefined;
+        toast.error(coded ?? (error instanceof Error ? error.message : String(error)));
+      }
     },
-    [activeId, refreshList],
+    [activeId, refreshList, t],
   );
 
   const handleSelectBranch = React.useCallback(
@@ -1520,11 +1572,13 @@ function ConversationsPageInner() {
           messageId,
         },
       );
+      // fork 结果在本窗格打开:先聚焦,路由同步效应会把新会话挂进聚焦窗格。
+      focusSelf();
       setActiveId(response.conversationId);
       navigate(`/c/${response.conversationId}`);
       refreshList();
     },
-    [activeId, navigate, refreshList, setActiveId],
+    [activeId, focusSelf, navigate, refreshList, setActiveId],
   );
 
   const handleTranslateMessage = React.useCallback(async (messageId: string) => {
@@ -1583,6 +1637,21 @@ function ConversationsPageInner() {
   );
 
   const handleSend = React.useCallback(async () => {
+    // 域9-1(3B)防御层:发送门禁主判定在 chat-input(按钮灰+发送键短路),这里再兜一层
+    // ——编辑会话/快捷键/程序化触发等绕开按钮的路径,也不会把"解析中"的附件发出去。
+    const draftPartsForGate = getCurrentSubmitParts();
+    const parsingIds = useChatInputStore.getState().parsingFileIds;
+    if (
+      parsingIds.length > 0 &&
+      draftPartsForGate.some((part) => {
+        const fileId = part.metadata?.fileId;
+        return typeof fileId === "number" && parsingIds.includes(fileId);
+      })
+    ) {
+      toast.info(t("input:chat.parsing_send_blocked"));
+      return;
+    }
+
     if (!editingSession) {
       await handleSubmit();
       refreshList();
@@ -1591,7 +1660,7 @@ function ConversationsPageInner() {
 
     if (!activeId) return;
 
-    const draftParts = getCurrentSubmitParts();
+    const draftParts = draftPartsForGate;
     if (draftParts.length === 0) return;
 
     const nextParts = buildEditedParts(editingSession, draftParts);
@@ -1610,91 +1679,8 @@ function ConversationsPageInner() {
     getCurrentSubmitParts,
     handleSubmit,
     refreshList,
+    t,
   ]);
-
-  const handleTogglePinConversation = React.useCallback(
-    async (conversationId: string) => {
-      await api.post<{ status: string }>(`conversations/${conversationId}/pin`);
-      refreshList();
-    },
-    [refreshList],
-  );
-
-  const handleRegenerateConversationTitle = React.useCallback(
-    async (conversationId: string) => {
-      // R7-4:标题生成设 120s 客户端上限(原 timeout:false 会让侧栏 spinner 跟着卡死的
-      // 后端无限转)。ky 超时会 abort 底层请求;后端在落库前检查 request.signal,
-      // 超时后的迟到结果不落库。
-      await api.post<{ status: string }>(
-        `conversations/${conversationId}/regenerate-title`,
-        undefined,
-        { timeout: 120_000 },
-      );
-      // 有活跃订阅(当前打开/未来其它页签)才需要重取,refreshConversation 对未订阅 id 空操作
-      refreshConversation(conversationId);
-      refreshList();
-    },
-    [refreshList],
-  );
-
-  const handleMoveConversation = React.useCallback(
-    async (conversationId: string, assistantId: string) => {
-      await api.post<{ status: string }>(`conversations/${conversationId}/move`, { assistantId });
-      if (conversationId === activeId) {
-        setActiveId(null);
-        setHomeDraftId(createHomeDraftId());
-        if (routeId === conversationId) {
-          navigate("/", { replace: true });
-        }
-      }
-      refreshList();
-    },
-    [activeId, navigate, refreshList, routeId, setActiveId],
-  );
-
-  const handleUpdateConversationTitle = React.useCallback(
-    async (conversationId: string, title: string) => {
-      await api.post<{ status: string }>(`conversations/${conversationId}/title`, { title });
-      refreshList();
-    },
-    [refreshList],
-  );
-
-  const handleDeleteConversation = React.useCallback(
-    async (conversationId: string) => {
-      await api.delete<Record<string, never>>(`conversations/${conversationId}`, {
-        parseJson: (raw) => (raw ? JSON.parse(raw) : {}),
-      });
-      evictConversations([conversationId]);
-      if (conversationId === activeId) {
-        setActiveId(null);
-        setHomeDraftId(createHomeDraftId());
-        if (routeId === conversationId) {
-          navigate("/", { replace: true });
-        }
-      }
-      refreshList();
-    },
-    [activeId, navigate, refreshList, routeId, setActiveId],
-  );
-
-  const handleDeleteConversations = React.useCallback(
-    async (conversationIds: string[]) => {
-      await api.post<{ status: string; deleted: number }>("conversations/batch-delete", {
-        ids: conversationIds,
-      });
-      evictConversations(conversationIds);
-      if (activeId && conversationIds.includes(activeId)) {
-        setActiveId(null);
-        setHomeDraftId(createHomeDraftId());
-        if (routeId && conversationIds.includes(routeId)) {
-          navigate("/", { replace: true });
-        }
-      }
-      refreshList();
-    },
-    [activeId, navigate, refreshList, routeId, setActiveId],
-  );
 
   const handleCompressConversation = React.useCallback(() => {
     if (!activeId) return;
@@ -1702,8 +1688,7 @@ function ConversationsPageInner() {
   }, [activeId]);
 
   // 提示词优化时提取最近 3 轮对话(6 条消息)的纯文本,让优化模型理解"那个""上次的"等指代。
-  // 只取 text part —— 图片(image)、文件(document)、工具调用(tool)、思维链(reasoning)全部被
-  // filter 排除,不会发给优化模型。截断到 4000 字符避免吃掉 token 预算。首条消息时返回空。
+  // 只取 text part,截断到 4000 字符;首条消息时返回空。
   const getOptimizeContext = React.useCallback((): string => {
     // 点击优化时按需读取(不订阅):事件处理器拿最新值即可,不为它拉宽重渲染面
     const detail = activeId ? useConversationStore.getState().entries[activeId]?.detail : null;
@@ -1721,108 +1706,107 @@ function ConversationsPageInner() {
         .join("")
         .trim();
       if (!text) continue;
-      lines.push(`${message.role === "USER" ? t("conversations.optimize_context.user") : t("conversations.optimize_context.assistant")}: ${text}`);
+      lines.push(
+        `${message.role === "USER" ? t("conversations.optimize_context.user") : t("conversations.optimize_context.assistant")}: ${text}`,
+      );
     }
     return lines.join("\n\n").slice(0, 4000);
   }, [activeId]);
 
-  const handleConfirmCompressConversation = React.useCallback(async () => {
-    if (!activeId) return;
-    setCompressing(true);
-    const controller = new AbortController();
-    compressAbortRef.current = controller;
-    try {
-      await api.post<{ status: string }>(
-        `conversations/${activeId}/compress`,
-        {
-          targetTokens: compressTargetTokens,
-          additionalPrompt: compressAdditionalPrompt,
-          keepRecentMessages: compressKeepRecent,
-        },
-        { timeout: false, signal: controller.signal },
-      );
-      setCompressDialogOpen(false);
-      refreshConversation(activeId);
-      refreshList();
-      toast.success(t("conversations.compress.success"));
-    } catch (error) {
-      // R7-4:用户主动取消不报错(取消不是失败)。
-      if (!controller.signal.aborted) {
-        toast.error(error instanceof Error ? error.message : t("conversations.compress.failed"));
+  // 压缩执行共享通道:压缩框与 /compact 指令两个入口走同一函数、同一状态与反馈
+  // (方案 §5.1,无平行逻辑)。指令路径不传 UI 历史压缩参数(走服务端默认),失败提示
+  // 带指令名前缀(方案 §4.4)。
+  const performCompress = React.useCallback(
+    async (
+      params: { additionalPrompt: string; targetTokens?: number; keepRecentMessages?: number },
+      errorPrefix = "",
+    ) => {
+      if (!activeId) return;
+      // 捕获发起时的会话 id:压缩期间用户可能切换会话,begin/end/刷新都要落在原会话上。
+      const conversationId = activeId;
+      const controller = new AbortController();
+      useCompressStore.getState().begin(conversationId, controller);
+      try {
+        // status 契约:compressed / aborted(服务端收到取消后静默吞掉 AbortError 的确认,
+        // 不带成功文案)。客户端 abort 路径抛 AbortError;服务端已停止但 fetch 尚未断时
+        // 走这里——同一轻量确认文案,不弹成功。
+        const result = await api.post<{ status: string }>(`conversations/${conversationId}/compress`, params, {
+          timeout: false,
+          signal: controller.signal,
+        });
+        setCompressDialogOpen(false);
+        if (result.status === "aborted") {
+          toast.info(t("conversations.compress.aborted"));
+        } else {
+          refreshConversation(conversationId);
+          refreshList();
+          toast.success(
+            isWorkspaceConversation
+              ? t("conversations.compress.workspace_success")
+              : t("conversations.compress.success"),
+          );
+        }
+      } catch (error) {
+        // R7-4:用户主动取消不报错(取消不是失败)——给一条轻量确认,明确上下文未受影响
+        // (内测反馈:中止后毫无反应,用户不确定压缩到底做没做)。
+        if (controller.signal.aborted) {
+          toast.info(t("conversations.compress.aborted"));
+        } else {
+          // 带业务码的错误按码查 i18n 文案(服务端 CodedError 通道;查不到用后端 message 兜底)。
+          const coded =
+            error instanceof ApiError && error.errorCode
+              ? t(`conversations.compress.error.${error.errorCode}`, { defaultValue: error.message })
+              : undefined;
+          const message =
+            coded ?? (error instanceof Error ? error.message : t("conversations.compress.failed"));
+          toast.error(`${errorPrefix}${message}`);
+        }
+      } finally {
+        useCompressStore.getState().end(conversationId);
       }
-    } finally {
-      compressAbortRef.current = null;
-      setCompressing(false);
+    },
+    [activeId, isWorkspaceConversation, refreshList],
+  );
+
+  const handleConfirmCompressConversation = React.useCallback(async () => {
+    await performCompress({
+      targetTokens: compressTargetTokens,
+      additionalPrompt: compressAdditionalPrompt,
+      keepRecentMessages: compressKeepRecent,
+    });
+  }, [compressAdditionalPrompt, compressKeepRecent, compressTargetTokens, performCompress]);
+
+  // ── 斜杠指令:清单(服务端权威)+ 执行分发表(实现池前端部分;方案 §3.4) ──────
+  const availableSlashCommands = useAvailableCommands(activeId);
+  // 域5-1(3F):执行器返回 false=未受理(如压缩占用),chat-input 据此回填原文;正常受理返回 void。
+  const slashExecutors: Record<string, (argument: string) => Promise<boolean | void>> = React.useMemo(
+    () => ({
+      // /compact [额外指示] → 既有压缩链路;进行中再触发提示占用(复用现有互斥)并告知未受理。
+      compact: async (argument: string) => {
+        if (compressing) {
+          toast.error(t("conversations.compress.busy"));
+          return false;
+        }
+        await performCompress({ additionalPrompt: argument }, "/compact ");
+      },
+    }),
+    [compressing, performCompress, t],
+  );
+  // 防两表漂移(方案 §3.1):服务端说可用但前端无执行器的指令不展示,并留痕便于排查。
+  const slashCommands = React.useMemo(() => {
+    const known = availableSlashCommands.filter((command) => command.name in slashExecutors);
+    if (known.length !== availableSlashCommands.length) {
+      const missing = availableSlashCommands.filter((c) => !(c.name in slashExecutors)).map((c) => c.name);
+      console.warn("[slash-commands] 服务端清单存在前端未实现的指令,已隐藏:", missing);
     }
-  }, [
-    activeId,
-    compressAdditionalPrompt,
-    compressKeepRecent,
-    compressTargetTokens,
-    refreshList,
-  ]);
-
-  const handleCreateConversation = React.useCallback(() => {
-    closePanel();
-    setActiveId(null);
-    setHomeDraftId(createHomeDraftId());
-
-    if (routeId) {
-      navigate("/");
-    }
-  }, [closePanel, navigate, routeId, setActiveId]);
-
-  // 切换到上/下个会话(按侧边栏列表顺序:置顶优先,然后按更新时间降序,与展示一致)。
-  const switchConversation = (direction: -1 | 1) => {
-    if (!activeId || conversations.length === 0) return;
-    const index = conversations.findIndex((c) => c.id === activeId);
-    if (index === -1) return;
-    const target = conversations[index + direction];
-    if (!target) return;
-    setActiveId(target.id);
-    navigate(`/c/${target.id}`);
-  };
-
-  // 重命名当前会话:打开自定义 Dialog(替代 WebView2 原生 prompt —— 其标题栏硬编码
-  // "localhost:8080 显示",无法定制、样式与应用割裂)。Dialog 内部处理输入校验与确认。
-  const [renameOpen, setRenameOpen] = React.useState(false);
-  const renameActiveConversation = () => {
-    if (!activeId) return;
-    if (!conversations.some((c) => c.id === activeId)) return;
-    setRenameOpen(true);
-  };
-
-  // 快捷键事件接入:ref 每次 render 更新最新闭包,useEffect 只挂一次监听,避免重建与陈旧。
-  const hotkeyHandlerRef = React.useRef<(action: HotkeyBusAction) => void>(() => {});
-  hotkeyHandlerRef.current = (action: HotkeyBusAction) => {
-    switch (action) {
-      case "newConversation":
-        handleCreateConversation();
-        break;
-      case "prevConversation":
-        switchConversation(-1);
-        break;
-      case "nextConversation":
-        switchConversation(1);
-        break;
-      case "renameConversation":
-        renameActiveConversation();
-        break;
-      case "searchConversations":
-        break;
-    }
-  };
-
-  React.useEffect(() => {
-    const actions: HotkeyBusAction[] = [
-      "newConversation",
-      "prevConversation",
-      "nextConversation",
-      "renameConversation",
-    ];
-    const offs = actions.map((action) => onHotkeyAction(action, () => hotkeyHandlerRef.current(action)));
-    return () => offs.forEach((off) => off());
-  }, []);
+    return known;
+  }, [availableSlashCommands, slashExecutors]);
+  const handleSlashCommand = React.useCallback(
+    async (name: string, argument: string) => {
+      return await slashExecutors[name]?.(argument);
+    },
+    [slashExecutors],
+  );
 
   const handleStop = React.useCallback(async () => {
     if (!activeId) return;
@@ -1857,168 +1841,130 @@ function ConversationsPageInner() {
       refreshList();
       toast.success(t("conversations.custom_prompt.saved"));
     },
-    [
-      activeAssistantForConversation?.allowConversationSystemPrompt,
-      activeId,
-      refreshList,
-    ],
+    [activeAssistantForConversation?.allowConversationSystemPrompt, activeId, refreshList],
   );
 
-  const hasWorkbenchPanel = Boolean(panel);
-  const workbenchPanelRef = React.useRef<PanelImperativeHandle | null>(null);
+  // 拖拽落点(J 轮二级 + L 轮一级统一到一套三分区):拖动标签悬停内容区时
+  // 左/中/右 三区高亮 —— 左/右 = 在本列左/右侧拆出新列,中 = 并入本列。
+  // 二级载荷(会话标签)在本容器内分栏/移动;一级载荷(容器)拆出/并入"组"——
+  // 与二级完全同构:中区 = 并入本组(组焦点换成它),左右 = 带着自己的会话标签
+  // 成独立新组。落点动作与高亮都读内存 store(dataTransfer 在 dragover 阶段读不到)。
+  // 屏上的列都属于各组焦点容器,所以拖焦点标签时"目标列 = 自己的列"是常态,不是异常:
+  // 落到自己列的左右缘 = 把自己从本组拆出去(与二级"把会话标签拖出本窗格"同构),
+  // 少了这条,焦点标签就成了唯一拖不出分栏的标签。
+  const dragPayload = useTabDragStore((state) => state.dragging);
+  const [dropZone, setDropZone] = React.useState<"left" | "center" | "right" | null>(null);
 
-  React.useEffect(() => {
-    if (isMobile) return;
+  const resolveDropZone = (event: React.DragEvent<HTMLDivElement>): "left" | "center" | "right" => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const ratio = (event.clientX - rect.left) / Math.max(1, rect.width);
+    return ratio < 0.25 ? "left" : ratio > 0.75 ? "right" : "center";
+  };
 
-    const workbenchPanel = workbenchPanelRef.current;
-    if (!workbenchPanel) return;
+  const handleZoneDrop = (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const payload = useTabDragStore.getState().dragging;
+    setDropZone(null);
+    useTabDragStore.getState().setDragging(null);
+    if (!payload) return;
+    const store = useContainerTabsStore.getState();
+    const zone = resolveDropZone(event);
 
-    if (hasWorkbenchPanel) {
-      workbenchPanel.expand();
-    } else {
-      workbenchPanel.collapse();
+    if (payload.kind === "container") {
+      const selfDrag = payload.container === container;
+      // 中区 = 并入本组;拖的是本组焦点容器时它已在本组,无动作。
+      if (selfDrag && zone === "center") return;
+      if (zone === "center") {
+        // 并入本组 = 激活它(已在屏上 = 换本组焦点;不在屏上 = 接替本组席位)。
+        // 激活前先聚焦本列:被接替的是本组,不是旧的全局焦点组。
+        store.focusPane(container, paneIndex);
+        store.activateContainer(payload.container);
+      } else {
+        // 拖出成新组:从原组移除(原组空了即消失)再落到本组左/右。
+        // 拖本组焦点容器时锚点取同组另一成员 —— 屏上的列都属于各组焦点容器,单组时
+        // 它悬停到的唯一目标就是自己的列,不接这一手它就成了唯一拆不出去的标签。
+        const anchor = selfDrag ? groupSiblingOf(store.groups, container) : container;
+        // 自锚/列满/本组只剩它自己(anchor 为 null)都会让 splitContainerBeside 返回 false:
+        // 守卫收口在 store 一处,视图不重复校验,只在被拒时统一外显原因。
+        if (
+          anchor === null ||
+          !store.splitContainerBeside(payload.container, anchor, zone === "left" ? "left" : "right")
+        ) {
+          toast.error(t("workspace.tabs.split_full", { max: MAX_PANES }));
+          return;
+        }
+      }
+      // 落定后按新状态取该容器的停留会话(state 已被 set 替换,须重新读)。
+      const next = useContainerTabsStore.getState();
+      const panes = next.panes[payload.container] ?? [];
+      const focus = Math.max(
+        0,
+        Math.min(next.focusedPane[payload.container] ?? 0, panes.length - 1),
+      );
+      const target = panes[focus]?.active ?? null;
+      navigate(target ? `/c/${target}` : "/");
+      return;
     }
-  }, [hasWorkbenchPanel, isMobile]);
 
-  const chatContent = (
-    <div
-      className={cn("flex flex-1 flex-col min-h-0 overflow-hidden", isNewChat && "justify-center")}
-    >
-      {!isNewChat && (
-        <>
-          {canOverrideConversationSystemPrompt && hasDetail ? (
-            <ConversationSystemPromptButton
-              value={conversationSystemPrompt}
-              onSave={handleSaveConversationSystemPromptValue}
-            />
-          ) : null}
-          <div className="relative flex min-h-0 flex-1">
-            <ConversationTimeline
-              activeId={activeId}
-              isHomeRoute={isHomeRoute}
-              settings={settings}
-              onEdit={handleStartEdit}
-              onDelete={handleDeleteMessage}
-              onFork={handleForkMessage}
-              onRegenerate={handleRegenerate}
-              onSelectBranch={handleSelectBranch}
-              onTranslate={handleTranslateMessage}
-              onToolApproval={handleToolApproval}
-            />
-          </div>
-        </>
-      )}
+    // 会话标签只在自己的容器内挪(跨容器等于改会话归属,不是布局操作)。
+    if (payload.container !== container) return;
+    if (zone === "center") {
+      store.moveConversationToPane(container, payload.conversationId, paneIndex);
+    } else {
+      const ok = store.splitConversation(
+        container,
+        payload.conversationId,
+        zone === "left" ? paneIndex : paneIndex + 1,
+      );
+      // 分栏被拒(可见列已满 / 源窗格只剩一个标签)→ 退化为移入本列。
+      if (!ok) store.moveConversationToPane(container, payload.conversationId, paneIndex);
+    }
+    navigate(`/c/${payload.conversationId}`);
+  };
 
-      <div>
-        {isNewChat && (
-          <div className="mb-4 text-center">
-            <div className="mb-4 flex justify-center">
-              <div className="[animation:rikkahub-breathe_4s_ease-in-out_infinite] [&>svg]:size-16">
-                <Logo className="size-16 text-primary" />
-              </div>
-            </div>
-            <p className="text-xl font-medium leading-relaxed text-foreground">
-              {t("conversations.welcome_prompt")}
-            </p>
-          </div>
-        )}
-        {/* Floating chunked-TTS play bar — pops in only while a message is being read out
-            via the per-chunk pipeline (TtsController), shows the dual ring + transport. */}
-        <TtsPlayBar />
-        <ChatInputArea
-          draftKey={draftKey}
-          isGenerating={conversationIsGenerating}
-          disabled={detailLoading || Boolean(detailError)}
-          isEditing={Boolean(editingSession)}
-          suggestions={displaySuggestions}
-          onSuggestionClick={handleClickSuggestion}
-          onCancelEdit={editingSession ? handleCancelEdit : undefined}
-          shouldDeleteFileOnRemove={shouldDeleteAttachmentFileOnRemove}
-          onSend={handleSend}
-          onStop={activeId ? handleStop : undefined}
-          onExportConversation={
-            hasMessages
-              ? async (includeReasoning: boolean) => {
-                  // 导出需要完整历史:窗口化(I-2)时先拉全量;拿不到完整历史则报错
-                  // 放弃,绝不导出被窗口截断的部分内容。
-                  const detail = activeId ? await ensureFullConversationDetail(activeId) : null;
-                  if (!detail) {
-                    if (activeId) toast.error(t("conversations.errors.load_detail_failed"));
-                    return;
-                  }
-                  const content = await convertConversationToMarkdown(detail, includeReasoning);
-                  const filename = safeMarkdownFilename(detail.title || "conversation");
-                  downloadMarkdown(content, filename);
-                }
-              : undefined
-          }
-          onCompressConversation={hasMessages ? handleCompressConversation : undefined}
-          getOptimizeContext={getOptimizeContext}
-        />
-      </div>
-    </div>
+  // 本列是否接受当前拖拽:决定落点覆盖层挂不挂(不接受时不拦截指针、也不高亮)。
+  // 一级载荷落到"自己这列"是常态而非异常(屏上的列都属于各组焦点容器),接与不接看
+  // 本组是否还有别人接手这一组:有 = 可拆出去;只剩它自己 = 已是独立组,无处可拆。
+  const selfContainerDrag = dragPayload?.kind === "container" && dragPayload.container === container;
+  const selfSplittable = useContainerTabsStore(
+    (state) => groupSiblingOf(state.groups, container) !== null,
   );
+  const dropActive =
+    dragPayload !== null &&
+    (dragPayload.kind === "container"
+      ? dragPayload.container !== container || selfSplittable
+      : dragPayload.container === container);
+  // 覆盖层的上边界:拖会话标签时让开标签行(它自己是"并入本列"的落点);拖容器时
+  // 标签行对它没有语义,铺满整列免留死区。
+  const hasTabStrip = useContainerTabsStore(
+    (state) => (state.panes[container]?.[paneIndex]?.tabs.length ?? 0) > 0,
+  );
+  const overlayTop = dragPayload?.kind === "conversation" && hasTabStrip ? "top-9" : "top-0";
 
   return (
-    <SidebarProvider defaultOpen className="h-svh overflow-hidden">
-      <GlobalDropZone draftKey={draftKey} disabled={detailLoading || Boolean(detailError)} />
-    <RenameConversationDialog
-      open={renameOpen}
-      onOpenChange={setRenameOpen}
-      currentTitle={conversations.find((c) => c.id === activeId)?.title ?? ""}
-      onConfirm={(nextTitle) => {
-        if (!activeId) return;
-        void handleUpdateConversationTitle(activeId, nextTitle);
-      }}
-    />
-      <ConversationSidebar
+    <PaneContainerProvider container={container}>
+    <div
+      className="relative flex h-full min-h-0 flex-1 flex-col"
+      // 点击非焦点列任意处 → 聚焦并把路由切到它的激活会话。会话标签自己会导航到它指定
+      // 的会话(data-tab-nav),不能让这里先抢一次焦点切换,否则先跳本列旧会话、
+      // 再跳目标会话,中间闪一帧。
+      onMouseDownCapture={
+        focused
+          ? undefined
+          : (event) => {
+              if ((event.target as HTMLElement).closest("[data-tab-nav]")) return;
+              onFocusPane(container, paneIndex);
+            }
+      }
+    >
+      <ConversationTabStrip
+        container={container}
+        paneIndex={paneIndex}
+        focused={focused}
         conversations={conversations}
-        activeId={activeId}
-        loading={loading}
-        error={error}
-        hasMore={hasMore}
-        loadMore={loadMore}
-        userName={
-          settings?.displaySetting.userNickname?.trim() || t("conversations.user.default_name")
-        }
-        userAvatar={settings?.displaySetting.userAvatar}
-        assistants={assistants}
-        assistantTags={settings?.assistantTags ?? []}
-        currentAssistantId={currentAssistantId}
-        onSelect={handleSelect}
-        onAssistantChange={handleAssistantChange}
-        onPin={handleTogglePinConversation}
-        onRegenerateTitle={handleRegenerateConversationTitle}
-        onMoveToAssistant={handleMoveConversation}
-        onUpdateTitle={handleUpdateConversationTitle}
-        onDelete={handleDeleteConversation}
-        onDeleteMany={handleDeleteConversations}
-        onCreateConversation={handleCreateConversation}
-        webAuthEnabled={settings?.webServerJwtEnabled === true}
-      />
-      <SidebarInset className="flex min-h-svh flex-col overflow-hidden">
-        {/* pt-9 (36px) 让出沉浸式标题栏的高度,避免 SidebarTrigger / 标题被透明标题栏盖住。
-            背景色仍由 SidebarInset 继承(--background),顶到窗口顶,和透明标题栏无缝衔接。
-            border-divider:用比 --border 更淡的分界色,让区域分隔退到背景里。 */}
-        <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-divider bg-background/95 px-4 pb-3 pt-9 shadow-sm backdrop-blur supports-backdrop-filter:bg-background/60">
-          <SidebarTrigger />
-          <div className="min-w-0 flex-1">
-            <div className="truncate text-sm font-medium text-muted-foreground">
-              {activeConversation
-                ? activeConversation.title
-                : t("conversations.header.select_conversation")}
-            </div>
-            {currentModel && currentProvider ? (
-              <div className="truncate text-xs text-muted-foreground/70">
-                {`${getAssistantDisplayName(currentAssistant?.name)} / ${getModelDisplayName(currentModel.displayName, currentModel.modelId)} (${currentProvider.name})${
-                  conversationCacheHitRate !== null
-                    ? ` / ${t("conversations.header.cache_hit_rate", { rate: conversationCacheHitRate })}`
-                    : ""
-                }`}
-              </div>
-            ) : null}
-          </div>
-          {canOverrideConversationSystemPrompt ? (
+        onRename={onRenameConversation}
+        trailing={
+          canOverrideConversationSystemPrompt ? (
             <Button
               type="button"
               variant="ghost"
@@ -2030,56 +1976,135 @@ function ConversationsPageInner() {
             >
               <Pencil className="size-4" />
             </Button>
-          ) : null}
-          <ThemeToggleButton />
-        </div>
+          ) : null
+        }
+      />
 
-        {!isMobile ? (
-          <ResizablePanelGroup orientation="horizontal" className="min-h-0 flex-1">
-            <ResizablePanel
-              defaultSize={hasWorkbenchPanel ? 64 : 100}
-              minSize={40}
-              className="flex min-h-0 flex-col"
-            >
-              {chatContent}
-            </ResizablePanel>
-            <ResizableHandle
-              withHandle
-              className={cn(!hasWorkbenchPanel && "pointer-events-none opacity-0")}
-            />
-            <ResizablePanel
-              defaultSize={hasWorkbenchPanel ? 36 : 0}
-              minSize={24}
-              collapsible
-              collapsedSize={0}
-              panelRef={workbenchPanelRef}
-              className="flex min-h-0 flex-col"
-            >
-              {panel ? (
-                <WorkbenchHost panel={panel} onClose={closePanel} className="border-l-0" />
-              ) : null}
-            </ResizablePanel>
-          </ResizablePanelGroup>
-        ) : (
-          chatContent
+      <div
+        className={cn(
+          "flex flex-1 flex-col min-h-0 overflow-hidden",
+          isNewChat && "justify-center",
+        )}
+      >
+        {!isNewChat && (
+          <>
+            {canOverrideConversationSystemPrompt && hasDetail ? (
+              <ConversationSystemPromptButton
+                value={conversationSystemPrompt}
+                onSave={handleSaveConversationSystemPromptValue}
+              />
+            ) : null}
+            <div className="relative flex min-h-0 flex-1">
+              <ConversationTimeline
+                activeId={activeId}
+                isHomeRoute={paneIsHome}
+                settings={settings}
+                onEdit={handleStartEdit}
+                onDelete={handleDeleteMessage}
+                onFork={handleForkMessage}
+                onRegenerate={handleRegenerate}
+                onSelectBranch={handleSelectBranch}
+                onTranslate={handleTranslateMessage}
+                onToolApproval={handleToolApproval}
+              />
+            </div>
+          </>
         )}
 
-        {isMobile && panel ? (
-          <Drawer
-            open={hasWorkbenchPanel}
-            onOpenChange={(open) => {
-              if (!open) {
-                closePanel();
-              }
-            }}
-            direction="bottom"
-          >
-            <DrawerContent className="h-[85vh] max-h-[85vh]">
-              <WorkbenchHost panel={panel} onClose={closePanel} className="border-l-0" />
-            </DrawerContent>
-          </Drawer>
-        ) : null}
-      </SidebarInset>
+        <div>
+          {isNewChat &&
+            (activeWorkspace ? (
+              <WorkspaceEmptyState workspace={activeWorkspace} onPrompt={handleClickSuggestion} />
+            ) : (
+              <div className="mb-6 text-center">
+                <EmptyGreeting />
+              </div>
+            ))}
+          {/* 分块 TTS 播放条是全局单例状态,只挂在聚焦窗格,避免分栏时重复显示。 */}
+          {focused ? <TtsPlayBar /> : null}
+          {/* pi 引擎瞬态状态条(P5):按窗格各自订阅本会话状态,分栏互不串扰。 */}
+          <EngineStatusBar conversationId={activeId} />
+          <ChatInputArea
+            draftKey={draftKey}
+            slashCommands={slashCommands}
+            onSlashCommand={handleSlashCommand}
+            isGenerating={conversationIsGenerating}
+            disabled={detailLoading || Boolean(detailError)}
+            isEditing={Boolean(editingSession)}
+            suggestions={displaySuggestions}
+            onSuggestionClick={handleClickSuggestion}
+            onCancelEdit={editingSession ? handleCancelEdit : undefined}
+            shouldDeleteFileOnRemove={shouldDeleteAttachmentFileOnRemove}
+            onSend={handleSend}
+            onStop={activeId ? handleStop : undefined}
+            onExportConversation={
+              hasMessages
+                ? async (includeReasoning: boolean) => {
+                    // 导出需要完整历史:窗口化(I-2)时先拉全量;拿不到完整历史则报错
+                    // 放弃,绝不导出被窗口截断的部分内容。
+                    const detail = activeId ? await ensureFullConversationDetail(activeId) : null;
+                    if (!detail) {
+                      if (activeId) toast.error(t("conversations.errors.load_detail_failed"));
+                      return;
+                    }
+                    const content = await convertConversationToMarkdown(detail, includeReasoning);
+                    const filename = safeMarkdownFilename(detail.title || "conversation");
+                    // 域10-1:桌面壳落盘 + 定位;浏览器维持下载(编排层分流)。
+                    await exportTextFile(content, filename);
+                  }
+                : undefined
+            }
+            onCompressConversation={hasMessages ? handleCompressConversation : undefined}
+            getOptimizeContext={getOptimizeContext}
+          />
+        </div>
+      </div>
+
+      {dropActive ? (
+        // 落点提示层:三区等分,命中区亮起品牌色薄底 + 描边,并给一句"放手会发生什么"。
+        // 只在本列接受当前拖拽时挂载 —— 不接受时既不拦指针也不亮,用户能看出此处不可放。
+        <div
+          className={cn("absolute inset-x-0 bottom-0 z-30", overlayTop)}
+          onDragOver={(event) => {
+            const zone = resolveDropZone(event);
+            // 拖本组焦点容器落回自己的中区 = 并入它已在的组,什么都不会发生:既不亮也不
+            // 拦指针(光标保持"不可放"),别承诺一个空动作。左右缘才是"拆出去"。
+            if (selfContainerDrag && zone === "center") {
+              setDropZone(null);
+              return;
+            }
+            event.preventDefault();
+            setDropZone(zone);
+          }}
+          onDragLeave={() => setDropZone(null)}
+          onDrop={handleZoneDrop}
+        >
+          {(["left", "center", "right"] as const).map((zone) => (
+            <div
+              key={zone}
+              className={cn(
+                "pointer-events-none absolute inset-y-1 flex items-center justify-center rounded-xl transition-all duration-150",
+                zone === "left" && "left-1 w-1/4",
+                zone === "center" && "left-1/4 right-1/4",
+                zone === "right" && "right-1 w-1/4",
+                dropZone === zone
+                  ? "bg-primary/10 ring-1 ring-primary/30"
+                  : "ring-1 ring-transparent",
+              )}
+            >
+              {dropZone === zone ? (
+                <span className="rounded-full bg-[var(--ds-surface-100)] px-2.5 py-1 text-mini font-medium text-[var(--ds-text-secondary)] shadow-[var(--ds-elevation-100)]">
+                  {t(
+                    zone === "center"
+                      ? "workspace.tabs.drop_hint_merge"
+                      : "workspace.tabs.drop_hint_split",
+                  )}
+                </span>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
 
       <Dialog
         open={compressDialogOpen}
@@ -2089,50 +2114,60 @@ function ConversationsPageInner() {
           <DialogHeader>
             <DialogTitle>{t("conversations.compress.dialog_title")}</DialogTitle>
             <DialogDescription>
-              {t("conversations.compress.dialog_description")}
+              {isWorkspaceConversation
+                ? t("conversations.compress.workspace_description")
+                : t("conversations.compress.dialog_description")}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-5">
-            <div className="space-y-2">
-              <div className="text-sm font-medium">{t("conversations.compress.target_tokens")}</div>
-              <div className="grid grid-cols-4 gap-2">
-                {COMPRESS_TOKEN_OPTIONS.map((value) => (
-                  <Button
-                    key={value}
-                    type="button"
-                    variant={compressTargetTokens === value ? "default" : "outline"}
-                    onClick={() => setCompressTargetTokens(value)}
-                  >
-                    {value}
-                  </Button>
-                ))}
-              </div>
-              <Input
-                type="number"
-                min={256}
-                value={compressTargetTokens}
-                onChange={(event) =>
-                  setCompressTargetTokens(Math.max(256, Number(event.target.value) || 2000))
-                }
-              />
-            </div>
-            <div className="space-y-2">
-              <div className="text-sm font-medium">{t("conversations.compress.keep_recent")}</div>
-              <div className="grid grid-cols-4 gap-2">
-                {COMPRESS_KEEP_OPTIONS.map((value) => (
-                  <Button
-                    key={value}
-                    type="button"
-                    variant={compressKeepRecent === value ? "default" : "outline"}
-                    onClick={() => setCompressKeepRecent(value)}
-                  >
-                    {value}
-                  </Button>
-                ))}
-              </div>
-            </div>
+            {/* P5:工作区会话走 pi 原生压缩,目标 Token/保留最近消息是 UI 历史压缩的
+                参数(服务端忽略),隐藏以免误导;额外要求透传为压缩自定义指示。 */}
+            {!isWorkspaceConversation ? (
+              <>
+                <div className="space-y-2">
+                  <div className="text-sm font-medium">{t("conversations.compress.target_tokens")}</div>
+                  <div className="grid grid-cols-4 gap-2">
+                    {COMPRESS_TOKEN_OPTIONS.map((value) => (
+                      <Button
+                        key={value}
+                        type="button"
+                        variant={compressTargetTokens === value ? "default" : "outline"}
+                        onClick={() => setCompressTargetTokens(value)}
+                      >
+                        {value}
+                      </Button>
+                    ))}
+                  </div>
+                  <Input
+                    type="number"
+                    min={256}
+                    value={compressTargetTokens}
+                    onChange={(event) =>
+                      setCompressTargetTokens(Math.max(256, Number(event.target.value) || 2000))
+                    }
+                  />
+                </div>
+                <div className="space-y-2">
+                  <div className="text-sm font-medium">{t("conversations.compress.keep_recent")}</div>
+                  <div className="grid grid-cols-4 gap-2">
+                    {COMPRESS_KEEP_OPTIONS.map((value) => (
+                      <Button
+                        key={value}
+                        type="button"
+                        variant={compressKeepRecent === value ? "default" : "outline"}
+                        onClick={() => setCompressKeepRecent(value)}
+                      >
+                        {value}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+              </>
+            ) : null}
             <label className="block space-y-2">
-              <span className="text-sm font-medium">{t("conversations.compress.additional_prompt")}</span>
+              <span className="text-sm font-medium">
+                {t("conversations.compress.additional_prompt")}
+              </span>
               <Textarea
                 value={compressAdditionalPrompt}
                 onChange={(event) => setCompressAdditionalPrompt(event.target.value)}
@@ -2147,8 +2182,8 @@ function ConversationsPageInner() {
               variant="outline"
               onClick={() => {
                 // R7-4:压缩中点取消 = 中止请求并关框(后端保证取消后不改写会话);
-                // 未压缩时就是普通关闭。
-                compressAbortRef.current?.abort();
+                // 未压缩时就是普通关闭。取消句柄在全局 store,切页回来仍可取消。
+                if (activeId) useCompressStore.getState().cancel(activeId);
                 setCompressDialogOpen(false);
               }}
             >
@@ -2208,7 +2243,6 @@ function ConversationsPageInner() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-
       <Dialog open={systemPromptDialogOpen} onOpenChange={setSystemPromptDialogOpen}>
         <DialogContent className="max-w-2xl">
           <DialogHeader>
@@ -2233,6 +2267,602 @@ function ConversationsPageInner() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+    </div>
+    </PaneContainerProvider>
+  );
+});
+
+function ConversationsPageInner() {
+  const { t } = useTranslation("page");
+  const navigate = useNavigate();
+  const { id: routeId } = useParams();
+  const isHomeRoute = !routeId;
+  const isMobile = useIsMobile();
+  const { panel, closePanel } = useWorkbench();
+
+  const { settings, assistants, currentAssistantId, currentAssistant } = useCurrentAssistant();
+  const { conversations, activeId, setActiveId, loading, error, hasMore, loadMore, refreshList } =
+    useConversationList({ currentAssistantId, routeId, autoSelectFirst: !isHomeRoute });
+
+  const [homeDraftId, setHomeDraftId] = React.useState(() => createHomeDraftId());
+
+  const activeConversation = conversations.find((item) => item.id === activeId);
+  // ===== 双层标签页(工作区 M2-1) =====
+  // 路由 /c/:id 是权威:会话的容器归属(列表 meta 或详情快照的 workspaceId)一旦可知,
+  // 就把对应容器与会话标签打开——搜索跨容器命中、外部链接进入都自然切换容器。
+  // J 轮分栏:openConversation 命中已开窗格时聚焦过去,否则进当前聚焦窗格。
+  const detailWorkspaceId = useConversationStore((state) =>
+    activeId ? state.entries[activeId]?.detail?.workspaceId : undefined,
+  );
+  React.useEffect(() => {
+    if (!activeId) return;
+    const workspaceId = activeConversation ? activeConversation.workspaceId : detailWorkspaceId;
+    if (workspaceId === undefined) return; // 归属未知(列表/详情都未到),等下一拍
+    useContainerTabsStore.getState().openConversation(workspaceId ?? CHAT_CONTAINER, activeId);
+  }, [activeId, activeConversation, detailWorkspaceId]);
+  const activeContainer = useContainerTabsStore((state) => state.activeTab);
+  // M3-6:工作区容器的首屏空态需要工作区实体(名称/类型/root)。并排后按列取——
+  // 每列显示自己容器的空态,而不是聚焦列容器的。
+  const workspaces = useWorkspaceStore((state) => state.workspaces);
+  const workspaceOf = React.useCallback(
+    (container: ContainerKey) =>
+      container === CHAT_CONTAINER
+        ? undefined
+        : workspaces.find((item) => item.id === container),
+    [workspaces],
+  );
+  // 侧栏语义随容器切换(方案 §3.1):只列当前容器的会话;完整列表仍用于标题查找等。
+  const containerConversations = React.useMemo(
+    () =>
+      conversations.filter((item) =>
+        activeContainer === CHAT_CONTAINER
+          ? item.workspaceId == null
+          : item.workspaceId === activeContainer,
+      ),
+    [activeContainer, conversations],
+  );
+
+  // 分栏(L 轮分区模型):屏幕列 = 各组焦点容器 × 各自窗格,摊平后左→右渲染。焦点列的
+  // 会话以路由为权威,其余列用各自窗格的激活标签。
+  // 订阅整个 panes(而非只订阅激活容器的):分栏后同屏有多个容器的窗格,都要参与摊平。
+  // 代价可忽略——panes 只在用户开/关/拖标签时变,那些动作本就伴随导航重渲染。
+  const groups = useContainerTabsStore((state) => state.groups);
+  const openTabs = useContainerTabsStore((state) => state.openTabs);
+  const panesRecord = useContainerTabsStore((state) => state.panes);
+  const columns = React.useMemo(
+    () => flattenColumns(groups, panesRecord, activeContainer),
+    [groups, panesRecord, activeContainer],
+  );
+  // 幽灵标签(开着的容器不在任何组):缀在全局焦点组的标签栏尾部渲染,保持可见可点;
+  // 其它组的条不收容它们,免得用户切焦点组时标签跟着乱跳。
+  const ghostTabs = React.useMemo(
+    () => openTabs.filter((key) => !groups.some((group) => group.includes(key))),
+    [openTabs, groups],
+  );
+  const focusedPaneIndex = useContainerTabsStore((state) => {
+    const count = state.panes[state.activeTab]?.length ?? 1;
+    return Math.max(0, Math.min(state.focusedPane[state.activeTab] ?? 0, count - 1));
+  });
+
+  const handleFocusPane = React.useCallback(
+    (container: ContainerKey, index: number) => {
+      const store = useContainerTabsStore.getState();
+      const count = store.panes[container]?.length ?? 1;
+      const current = Math.max(0, Math.min(store.focusedPane[container] ?? 0, count - 1));
+      if (store.activeTab === container && current === index) return;
+      const target = store.focusPane(container, index);
+      setActiveId(target);
+      navigate(target ? `/c/${target}` : "/");
+    },
+    [navigate, setActiveId],
+  );
+
+  React.useEffect(() => {
+    const base = t("conversations.meta.title");
+    document.title = activeConversation?.title ? `${activeConversation.title} - ${base}` : base;
+    return () => {
+      document.title = base;
+    };
+  }, [activeConversation?.title, t]);
+
+  const handleSelect = React.useCallback(
+    (id: string, messageId?: string) => {
+      setActiveId(id);
+      // 搜索命中带 messageId 时通过 URL query 传给详情页,加载完成后滚到那条消息位置
+      // (对齐安卓);普通点击不带 messageId,维持原"进入会话滚底部"行为。
+      const target = messageId ? `/c/${id}?msg=${messageId}` : `/c/${id}`;
+      // 同会话也要 navigate 以更新 query(搜索当前会话的某条消息)
+      if (routeId !== id || messageId) {
+        navigate(target);
+      }
+    },
+    [navigate, routeId, setActiveId],
+  );
+
+  const handleAssistantChange = React.useCallback(
+    async (assistantId: string) => {
+      await api.post<{ status: string }>("settings/assistant", { assistantId });
+      await refreshSettingsStore();
+      setActiveId(null);
+      if (routeId) {
+        navigate("/", { replace: true });
+      }
+      refreshList();
+    },
+    [navigate, refreshList, routeId, setActiveId],
+  );
+
+  const handleTogglePinConversation = React.useCallback(
+    async (conversationId: string) => {
+      await api.post<{ status: string }>(`conversations/${conversationId}/pin`);
+      refreshList();
+    },
+    [refreshList],
+  );
+
+  const handleRegenerateConversationTitle = React.useCallback(
+    async (conversationId: string) => {
+      // R7-4:标题生成设 120s 客户端上限(原 timeout:false 会让侧栏 spinner 跟着卡死的
+      // 后端无限转)。ky 超时会 abort 底层请求;后端在落库前检查 request.signal,
+      // 超时后的迟到结果不落库。
+      await api.post<{ status: string }>(
+        `conversations/${conversationId}/regenerate-title`,
+        undefined,
+        { timeout: 120_000 },
+      );
+      // 有活跃订阅(当前打开/未来其它页签)才需要重取,refreshConversation 对未订阅 id 空操作
+      refreshConversation(conversationId);
+      refreshList();
+    },
+    [refreshList],
+  );
+
+  const handleMoveConversation = React.useCallback(
+    async (conversationId: string, assistantId: string) => {
+      await api.post<{ status: string }>(`conversations/${conversationId}/move`, { assistantId });
+      if (conversationId === activeId) {
+        setActiveId(null);
+        setHomeDraftId(createHomeDraftId());
+        if (routeId === conversationId) {
+          navigate("/", { replace: true });
+        }
+      }
+      refreshList();
+    },
+    [activeId, navigate, refreshList, routeId, setActiveId],
+  );
+
+  const handleUpdateConversationTitle = React.useCallback(
+    async (conversationId: string, title: string) => {
+      await api.post<{ status: string }>(`conversations/${conversationId}/title`, { title });
+      refreshList();
+    },
+    [refreshList],
+  );
+
+  const handleDeleteConversation = React.useCallback(
+    async (conversationId: string) => {
+      await api.delete<Record<string, never>>(`conversations/${conversationId}`, {
+        parseJson: (raw) => (raw ? JSON.parse(raw) : {}),
+      });
+      evictConversations([conversationId]);
+      useContainerTabsStore.getState().forgetConversation(conversationId);
+      if (conversationId === activeId) {
+        setActiveId(null);
+        setHomeDraftId(createHomeDraftId());
+        if (routeId === conversationId) {
+          navigate("/", { replace: true });
+        }
+      }
+      refreshList();
+    },
+    [activeId, navigate, refreshList, routeId, setActiveId],
+  );
+
+  const handleDeleteConversations = React.useCallback(
+    async (conversationIds: string[]) => {
+      await api.post<{ status: string; deleted: number }>("conversations/batch-delete", {
+        ids: conversationIds,
+      });
+      evictConversations(conversationIds);
+      for (const id of conversationIds) useContainerTabsStore.getState().forgetConversation(id);
+      if (activeId && conversationIds.includes(activeId)) {
+        setActiveId(null);
+        setHomeDraftId(createHomeDraftId());
+        if (routeId && conversationIds.includes(routeId)) {
+          navigate("/", { replace: true });
+        }
+      }
+      refreshList();
+    },
+    [activeId, navigate, refreshList, routeId, setActiveId],
+  );
+
+  const handleCreateConversation = React.useCallback(() => {
+    closePanel();
+    setActiveId(null);
+    setHomeDraftId(createHomeDraftId());
+
+    if (routeId) {
+      navigate("/");
+    }
+  }, [closePanel, navigate, routeId, setActiveId]);
+
+  // 切换到上/下个会话(按侧边栏列表顺序:置顶优先,然后按更新时间降序,与展示一致)。
+  const switchConversation = (direction: -1 | 1) => {
+    if (!activeId || containerConversations.length === 0) return;
+    const index = containerConversations.findIndex((c) => c.id === activeId);
+    if (index === -1) return;
+    const target = containerConversations[index + direction];
+    if (!target) return;
+    setActiveId(target.id);
+    navigate(`/c/${target.id}`);
+  };
+
+  // 重命名当前会话:打开自定义 Dialog(替代 WebView2 原生 prompt —— 其标题栏硬编码
+  // "localhost:8080 显示",无法定制、样式与应用割裂)。Dialog 内部处理输入校验与确认。
+  const [renameOpen, setRenameOpen] = React.useState(false);
+  const renameActiveConversation = () => {
+    if (!activeId) return;
+    if (!conversations.some((c) => c.id === activeId)) return;
+    setRenameOpen(true);
+  };
+
+  // 快捷键事件接入:ref 每次 render 更新最新闭包,useEffect 只挂一次监听,避免重建与陈旧。
+  const hotkeyHandlerRef = React.useRef<(action: HotkeyBusAction) => void>(() => {});
+  hotkeyHandlerRef.current = (action: HotkeyBusAction) => {
+    switch (action) {
+      case "newConversation":
+        handleCreateConversation();
+        break;
+      case "prevConversation":
+        switchConversation(-1);
+        break;
+      case "nextConversation":
+        switchConversation(1);
+        break;
+      case "renameConversation":
+        renameActiveConversation();
+        break;
+      case "searchConversations":
+        break;
+    }
+  };
+
+  React.useEffect(() => {
+    const actions: HotkeyBusAction[] = [
+      "newConversation",
+      "prevConversation",
+      "nextConversation",
+      "renameConversation",
+    ];
+    const offs = actions.map((action) =>
+      onHotkeyAction(action, () => hotkeyHandlerRef.current(action)),
+    );
+    return () => offs.forEach((off) => off());
+  }, []);
+
+  const hasWorkbenchPanel = Boolean(panel);
+  const workbenchPanelRef = React.useRef<PanelImperativeHandle | null>(null);
+  // 用户上次调整的工作台宽度(占组宽百分比),关闭再打开时恢复。
+  const workbenchWidthRef = React.useRef(WORKBENCH_DEFAULT_WIDTH_PCT);
+  // 一级分栏的组面板组:新组成立即与它组等宽(用户抱怨"拆完两栏不对称")。
+  const outerGroupRef = React.useRef<GroupImperativeHandle | null>(null);
+
+  // 工作台开合的根治方案(用户反馈:关闭后空间不回收/拖到边缘后重开只剩一条缝):
+  // react-resizable-panels v4 的三个坑一起踩过——
+  //   1. 数字尺寸按"像素"解析(字符串才是百分比),原 defaultSize={36}/minSize={24}
+  //      全是像素级碎宽,面板可被拖成任意残缝;
+  //   2. 动态 defaultSize 在 Panel 的重注册依赖里,每次开关都触发 unregister/register,
+  //      清空宽度记忆并与命令式调用竞态——关闭后 collapse() 的结果被重注册布局盖掉;
+  //   3. expand() 仅在当前尺寸"恰好等于 collapsedSize"时动作,残缝宽度让它彻底失灵。
+  // 因此:约束全部改为静态百分比字符串(杜绝重注册),开合一律用无前置条件的 resize()
+  // 显式驱动,宽度记忆由 onResize 维护。
+  React.useEffect(() => {
+    if (isMobile) return;
+
+    const workbenchPanel = workbenchPanelRef.current;
+    if (!workbenchPanel) return;
+
+    if (panel) {
+      workbenchPanel.resize(`${workbenchWidthRef.current}%`);
+    } else {
+      workbenchPanel.resize("0%");
+    }
+  }, [panel, isMobile]);
+
+  // 一级分栏对称初值(用户反馈:拖出一级分栏后两栏不是默认对称摆放):
+  // v4 的动态面板仅保证 minSize 合规,新组会按比例摊薄既有宽度(如 95/5 拆成 90/5/5)。
+  // 只在"组数变多"且用户没拖过分隔条(layout 仍全员等宽)时重铺等宽;用户已拖过的
+  // 布局原样尊重。effect 里的 setLayout 已保证此刻所有面板都注册完毕。
+  const groupsCountRef = React.useRef(groups.length);
+  React.useEffect(() => {
+    if (isMobile) return;
+    const grew = groups.length > groupsCountRef.current;
+    groupsCountRef.current = groups.length;
+    if (!grew || groups.length < 2) return;
+    const group = outerGroupRef.current;
+    if (!group) return;
+    const layout = group.getLayout();
+    const workbench = hasWorkbenchPanel ? Math.max(0, layout["workbench-panel"] ?? 0) : 0;
+    const ids = groups.map((_, gi) => `group-panel-${gi}`);
+    const sizes = ids.map((id) => layout[id] ?? NaN);
+    const alreadyEqual = sizes.every(
+      (size) => Number.isFinite(size) && Math.abs(size - sizes[0]!) < 0.5,
+    );
+    // 面板可能尚未注册(组数刚变的第一帧):缺哪块就跳过,等下一次布局变化再说,
+    // 绝不写半截布局(见下"5% 裂条"风险)。
+    if (!sizes.every((size) => Number.isFinite(size))) return;
+    if (!alreadyEqual) return;
+    const share = (100 - workbench) / ids.length;
+    group.setLayout(Object.fromEntries(ids.map((id) => [id, share])));
+  }, [groups, isMobile, hasWorkbenchPanel]);
+
+  // 全局拖放附件落进聚焦窗格的草稿(草稿键推导与窗格内 useDraftInputController 一致)。
+  const focusedDraftKey = activeId ?? (isHomeRoute ? homeDraftId : null);
+  const focusedDetailLoading = useConversationStore((state) => {
+    if (!activeId) return false;
+    const entry = state.entries[activeId];
+    return (entry?.subscribing ?? false) && (entry?.detail ?? null) === null;
+  });
+  const focusedDetailError = useConversationStore((state) =>
+    activeId ? (state.entries[activeId]?.error ?? null) : null,
+  );
+
+  // 路由会话属于哪一列(若它已在某列开着)。点非聚焦列的标签时,路由先变、下一拍才由
+  // 同步效应把焦点挪过去;这一帧里旧聚焦列若无条件采用 activeId,就会闪一下别人的会话。
+  // 反之,会话尚未落到任何列时(侧栏点击/新建)聚焦列必须立刻采用 activeId,否则每次
+  // 切会话都慢一帧。二者的分界正是"是否已被别的列占着"。
+  const routeColumnOwner = React.useMemo(() => {
+    if (!activeId) return null;
+    return columns.find((column) => column.pane.tabs.includes(activeId)) ?? null;
+  }, [activeId, columns]);
+
+  const renderColumn = (column: PaneColumn) => {
+    const focused = column.container === activeContainer && column.paneIndex === focusedPaneIndex;
+    const routeOwned =
+      routeColumnOwner === null ||
+      (routeColumnOwner.container === column.container &&
+        routeColumnOwner.paneIndex === column.paneIndex);
+    return (
+      <ConversationPaneView
+        container={column.container}
+        paneIndex={column.paneIndex}
+        focused={focused}
+        conversationId={focused && routeOwned ? activeId : column.pane.active}
+        isHomeRoute={isHomeRoute}
+        homeDraftId={homeDraftId}
+        setHomeDraftId={setHomeDraftId}
+        setActiveId={setActiveId}
+        navigate={navigate}
+        refreshList={refreshList}
+        settings={settings}
+        conversations={conversations}
+        activeWorkspace={workspaceOf(column.container)}
+        currentAssistantId={currentAssistantId}
+        currentAssistant={currentAssistant}
+        onRenameConversation={handleUpdateConversationTitle}
+        onFocusPane={handleFocusPane}
+      />
+    );
+  };
+
+  return (
+    <SidebarProvider defaultOpen className="h-svh overflow-hidden">
+      <GlobalDropZone
+        draftKey={focusedDraftKey}
+        disabled={focusedDetailLoading || Boolean(focusedDetailError)}
+      />
+      <RenameConversationDialog
+        open={renameOpen}
+        onOpenChange={setRenameOpen}
+        currentTitle={conversations.find((c) => c.id === activeId)?.title ?? ""}
+        onConfirm={(nextTitle) => {
+          if (!activeId) return;
+          void handleUpdateConversationTitle(activeId, nextTitle);
+        }}
+      />
+      <ConversationSidebar
+        conversations={containerConversations}
+        activeId={activeId}
+        loading={loading}
+        error={error}
+        hasMore={hasMore}
+        loadMore={loadMore}
+        userName={
+          settings?.displaySetting.userNickname?.trim() || t("conversations.user.default_name")
+        }
+        userAvatar={settings?.displaySetting.userAvatar}
+        assistants={assistants}
+        assistantTags={settings?.assistantTags ?? []}
+        currentAssistantId={currentAssistantId}
+        onSelect={handleSelect}
+        onAssistantChange={handleAssistantChange}
+        onPin={handleTogglePinConversation}
+        onRegenerateTitle={handleRegenerateConversationTitle}
+        onMoveToAssistant={handleMoveConversation}
+        onUpdateTitle={handleUpdateConversationTitle}
+        onDelete={handleDeleteConversation}
+        onDeleteMany={handleDeleteConversations}
+        onCreateConversation={handleCreateConversation}
+        webAuthEnabled={settings?.webServerJwtEnabled === true}
+      />
+      <SidebarInset className="flex min-h-svh flex-col overflow-hidden bg-transparent pt-1.5 pr-2 pb-2 pl-2">
+        {/* I1 窗控带:与画布同色(透明露底),右缘窗控钮;I4 减高 1/3(pt-1.5+22=28px),
+            与侧栏品牌行(h-7 上提 4px)垂直中心平齐。浏览器预览下组件返回 null。 */}
+        <WindowControlsBar />
+        {/* NewMax 内容列 = on-surface 着色 wrapper(撞色带):一级标签行浮在带顶,
+            下方白面板盖住其余部分,于是"带"只在标签行处露出;四周 SidebarInset 的
+            pt/pr/pb/pl 留出画布边距(左侧即侧栏与面板之间的 gap)。
+            L 轮分区模型:分栏时每组是一块同款"撞色带 + 白面板"的独立单元(自己的一级
+            标签栏只列本组成员 + 自己的内容列),与二级分栏"每列一条会话标签栏"同构;
+            组间由画布色缝隙分隔 —— "两个组"是比"同组两列"更重的边界。 */}
+        {groups.length === 1 || isMobile ? (
+          <div className="relative isolate flex min-h-0 flex-1 flex-col rounded-[18px] bg-[var(--ds-on-surface)] pt-[2px]">
+            {/* 一级容器标签行:窗控/拖拽由上方 WindowControlsBar 负责,本行纯交互。
+                z-[3] 压过白面板的 elevation-100 外环阴影(NewMax 同款层级):否则那道
+                0.5px 暗环会横穿焦点标签与面板的连接处,连体处凭空多出一条缝。 */}
+            <div className="relative z-[3] flex h-[31px] shrink-0 items-end gap-1 px-1">
+              <CollapsedSidebarTrigger />
+              <div className="relative flex h-full min-w-0 flex-1 items-end">
+                <ContainerTabBar
+                  group={groups[0] ?? [CHAT_CONTAINER]}
+                  groupIndex={0}
+                  ghostTabs={ghostTabs}
+                  headerTrailing={<ContainerPlusMenu />}
+                />
+              </div>
+            </div>
+            {/* 白色圆角内容面板:surface-200 底 + elevation-100,盖住撞色带主体,
+                焦点页签经连接条与面板连体;底部圆角与 wrapper 的 18px 对齐。
+                分栏:面板内是 1..MAX_PANES 个会话列(同容器的二级窗格)+ 工作台面板的横向可调组。 */}
+            <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-t-[16px] rounded-b-[18px] bg-[var(--ds-surface-200)] shadow-[var(--ds-elevation-100)]">
+              {!isMobile ? (
+                <ResizablePanelGroup orientation="horizontal" className="min-h-0 flex-1">
+                  {columns.map((column, index) => (
+                    <React.Fragment key={`${column.container}:${column.paneIndex}`}>
+                      {index > 0 ? <ResizableHandle /> : null}
+                      <ResizablePanel
+                        id={`conversation-column-${column.container}-${column.paneIndex}`}
+                        minSize="18%"
+                        className="flex min-h-0 flex-col"
+                      >
+                        {renderColumn(column)}
+                      </ResizablePanel>
+                    </React.Fragment>
+                  ))}
+                  <ResizableHandle
+                    withHandle
+                    className={cn(!hasWorkbenchPanel && "pointer-events-none opacity-0")}
+                  />
+                  <ResizablePanel
+                    id="workbench-panel"
+                    defaultSize="0%"
+                    minSize={`${WORKBENCH_MIN_WIDTH_PCT}%`}
+                    maxSize="60%"
+                    collapsible
+                    collapsedSize="0%"
+                    panelRef={workbenchPanelRef}
+                    onResize={(size) => {
+                      // 只记有效宽度:关闭态/收起吸附产生的 0 不覆盖用户偏好。
+                      if (size.asPercentage >= WORKBENCH_MIN_WIDTH_PCT) {
+                        workbenchWidthRef.current = size.asPercentage;
+                      }
+                    }}
+                    className="flex min-h-0 flex-col"
+                  >
+                    {panel ? (
+                      <WorkbenchHost panel={panel} onClose={closePanel} className="border-l-0" />
+                    ) : null}
+                  </ResizablePanel>
+                </ResizablePanelGroup>
+              ) : (
+                // 窄屏不分栏:只渲染焦点列(其它列的状态保留,回宽屏即恢复)。
+                renderColumn(
+                  columns.find(
+                    (column) =>
+                      column.container === activeContainer && column.paneIndex === focusedPaneIndex,
+                  ) ?? columns[0]!,
+                )
+              )}
+
+              {isMobile && panel ? (
+                <Drawer
+                  open={hasWorkbenchPanel}
+                  onOpenChange={(open) => {
+                    if (!open) {
+                      closePanel();
+                    }
+                  }}
+                  direction="bottom"
+                >
+                  <DrawerContent className="h-[85vh] max-h-[85vh]">
+                    <WorkbenchHost panel={panel} onClose={closePanel} className="border-l-0" />
+                  </DrawerContent>
+                </Drawer>
+              ) : null}
+            </div>
+          </div>
+        ) : (
+          // L 轮分区模型分栏:每组 = 撞色带 wrapper(自己的一级标签栏,渲染本组全部
+          // 标签)+ 白面板(该组焦点容器的二级列);工作台面板与组并列可调。"新建容器"
+          // 入口只在全局焦点组的标签栏上。
+          <ResizablePanelGroup orientation="horizontal" className="relative isolate flex min-h-0 flex-1" groupRef={outerGroupRef}>
+            {groups.map((group, groupIndex) => {
+              const focus = group.includes(activeContainer) ? activeContainer : group[0]!;
+              const groupColumns = columns.filter((column) => column.container === focus);
+              return (
+                // 面板 id 按下标而非焦点容器命名:焦点容器随用户点击切换,若 id 跟着换,
+                // v4 视作新面板注册,宽度记忆全丢。
+                <React.Fragment key={groupIndex}>
+                  {groupIndex > 0 ? (
+                    <ResizableHandle className="w-1.5 bg-transparent after:w-1.5" />
+                  ) : null}
+                  <ResizablePanel
+                    id={`group-panel-${groupIndex}`}
+                    minSize="18%"
+                    className="flex min-h-0 flex-col"
+                  >
+                    <div className="relative isolate flex min-h-0 flex-1 flex-col rounded-[18px] bg-[var(--ds-on-surface)] pt-[2px]">
+                      {/* z-[3] 同单组分支:压过面板阴影外环,连体处不出缝(见上方注释) */}
+                      <div className="relative z-[3] flex h-[31px] shrink-0 items-end gap-1 px-1">
+                        <div className="relative flex h-full min-w-0 flex-1 items-end">
+                          <ContainerTabBar
+                            group={group}
+                            groupIndex={groupIndex}
+                            ghostTabs={group.includes(activeContainer) ? ghostTabs : []}
+                            headerTrailing={group.includes(activeContainer) ? <ContainerPlusMenu /> : null}
+                          />
+                        </div>
+                      </div>
+                      <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-t-[16px] rounded-b-[18px] bg-[var(--ds-surface-200)] shadow-[var(--ds-elevation-100)]">
+                        <ResizablePanelGroup orientation="horizontal" className="min-h-0 flex-1">
+                          {groupColumns.map((column, index) => (
+                            <React.Fragment key={`${column.container}:${column.paneIndex}`}>
+                              {index > 0 ? <ResizableHandle /> : null}
+                              <ResizablePanel
+                                id={`conversation-column-${column.container}-${column.paneIndex}`}
+                                minSize="18%"
+                                className="flex min-h-0 flex-col"
+                              >
+                                {renderColumn(column)}
+                              </ResizablePanel>
+                            </React.Fragment>
+                          ))}
+                        </ResizablePanelGroup>
+                      </div>
+                    </div>
+                  </ResizablePanel>
+                </React.Fragment>
+              );
+            })}
+            <ResizableHandle
+              withHandle
+              className={cn("w-1.5 bg-transparent after:w-1.5", !hasWorkbenchPanel && "pointer-events-none opacity-0")}
+            />
+            <ResizablePanel
+              id="workbench-panel"
+              defaultSize="0%"
+              minSize={`${WORKBENCH_MIN_WIDTH_PCT}%`}
+              maxSize="60%"
+              collapsible
+              collapsedSize="0%"
+              panelRef={workbenchPanelRef}
+              onResize={(size) => {
+                // 只记有效宽度:关闭态/收起吸附产生的 0 不覆盖用户偏好。
+                if (size.asPercentage >= WORKBENCH_MIN_WIDTH_PCT) {
+                  workbenchWidthRef.current = size.asPercentage;
+                }
+              }}
+              className="flex min-h-0 flex-col"
+            >
+              {panel ? (
+                <WorkbenchHost panel={panel} onClose={closePanel} className="border-l-0" />
+              ) : null}
+            </ResizablePanel>
+          </ResizablePanelGroup>
+        )}
+      </SidebarInset>
     </SidebarProvider>
   );
 }

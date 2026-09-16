@@ -236,6 +236,56 @@ export interface Conversation {
    *  对齐安卓 Conversation.modeInjectionIds/lorebookIds)。缺省 = 空集。 */
   modeInjectionIds?: string[];
   lorebookIds?: string[];
+  /** 工作区归属(agent 模式)。null/缺省 = 对话模式。创建时绑定,不随会话迁移。
+   *  仅存 PC 自有库;跨端导出白名单不含此列(工作区会话到安卓降级为普通对话,§9.1)。 */
+  workspaceId?: string | null;
+  /** 会话级工作目录(绝对路径,必须在 workspace root 边界内)。null = workspace root。 */
+  workspaceCwd?: string | null;
+  /** P7 会话数据统一:引擎压缩记录数组(元素 {cutMessageId,summary,tokensBefore,
+   *  createdAt}),SQLite 单一事实源下压缩状态的唯一载体。压缩记录是引擎中性的
+   *  会话级状态(T3 泛化:压缩是引擎无关能力,不再绑死 pi)。切点为消息 id,从切点(含)
+   *  起保留原文、之前历史被 summary 取代;只有"切点仍在选中路径"的最新一条生效
+   *  (编码器自校验,编辑/fork 后失效记录自动跳过)。仅存 PC 自有库;跨端导出
+   *  白名单不含此列。 */
+  engineCompactions?: JsonValue[] | null;
+}
+
+// ----- 工作区(agent 模式)领域模型 -----
+
+export type WorkspaceType = "managed" | "folder";
+
+/** 审批档位(§3.2):read 恒免审;confirm_each=write/edit/bash 全审批;
+ *  balanced=区内写免审、bash 审批;full_access=全免审(危险命令拦截独立于档位,恒生效)。 */
+export type WorkspacePermissionPreset = "confirm_each" | "balanced" | "full_access";
+
+/** 运行时健康状态(计算属性,不落库):missing = 根目录丢失(对齐安卓 BROKEN 语义,不静默删记录)。 */
+export type WorkspaceStatus = "ready" | "missing";
+
+export interface Workspace {
+  id: string;
+  name: string;
+  type: WorkspaceType;
+  /** 边界根(绝对路径)。managed 型指向 dataDir/workspaces/<id>/files(载入时由 dataDir 计算,
+   *  DB 存空串——数据目录整体搬迁后自愈);folder 型为用户选择的真实目录(DB 存绝对路径)。 */
+  root: string;
+  permissionPreset: WorkspacePermissionPreset;
+  /** 信任门通过时间(§3.3)。managed 型创建即信任;folder 型 null = 未过信任门。 */
+  trustedAt: number | null;
+  createAt: number;
+  updateAt: number;
+  lastAccessAt: number;
+}
+
+export interface PcWorkspaceRow {
+  id: string;
+  name: string;
+  type: string;
+  root: string;
+  permission_preset: string;
+  trusted_at: number | null;
+  create_at: number;
+  update_at: number;
+  last_access_at: number;
 }
 
 export interface RequestLog {
@@ -308,6 +358,9 @@ export interface State {
   // 场景存在:①迁移失败时保留 state.json 原数据作重试源(performStateSave 按标记决定写盘
   // 保留,删了它 saveState 会把重试源抹掉);②备份导入流程的暂存中转(finalize 灌库后 delete)。
   conversations?: Conversation[];
+  // B6-①a:备份导入流程的工作区暂存中转(dump format 2 的 pc_workspace 行),与 conversations
+  // 同生命周期——finalize 随会话同事务灌库后 delete。仅暂存,运行时权威在活库。
+  pcWorkspaces?: PcWorkspaceRow[];
   files: StoredFile[];
   generatedImages: GeneratedImage[];
   logs: RequestLog[];
@@ -432,6 +485,9 @@ export interface PcConversationRow {
   update_at: number;
   mode_injection_ids?: string;
   lorebook_ids?: string;
+  workspace_id?: string | null;
+  workspace_cwd?: string | null;
+  engine_compactions?: string | null;
 }
 export interface PcMessageNodeRow {
   id: string;
@@ -537,6 +593,8 @@ export interface AuxiliaryTextOptions {
   customBody?: Record<string, any>;
   stream?: boolean;
   onDelta?: (text: string) => void;
+  /** 取消信号（压缩等可被用户中止的辅助调用）：中止立即撕底层连接，不空耗轮次。 */
+  signal?: AbortSignal;
 }
 
 export interface AsrRealtimeSession {

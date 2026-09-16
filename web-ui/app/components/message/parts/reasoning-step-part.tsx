@@ -5,7 +5,8 @@ import { useTranslation } from "react-i18next";
 import Markdown from "~/components/markdown/markdown";
 import type { ReasoningPart as UIReasoningPart } from "~/types";
 import Think from "~/assets/think.svg?react";
-import { extractThinkingTitle, serverNow } from "~/lib/utils";
+import { extractThinkingTitle } from "~/lib/utils";
+import { useElapsedSeconds } from "~/hooks/use-elapsed-since";
 
 import { useSettingsStore } from "~/stores";
 
@@ -13,7 +14,6 @@ import { ControlledChainOfThoughtStep } from "../chain-of-thought";
 
 interface ReasoningStepPartProps {
   reasoning: UIReasoningPart;
-  collapsedAdaptiveWidth?: boolean;
   isFirst?: boolean;
   isLast?: boolean;
 }
@@ -24,24 +24,8 @@ enum ReasoningCardState {
   Expanded = "expanded",
 }
 
-function formatDuration(createdAt?: string, finishedAt?: string | null): number | null {
-  if (!createdAt) return null;
-
-  const start = Date.parse(createdAt);
-  if (Number.isNaN(start)) return null;
-
-  const end = finishedAt ? Date.parse(finishedAt) : serverNow();
-  if (Number.isNaN(end)) return null;
-
-  const seconds = Math.max((end - start) / 1000, 0);
-  if (seconds <= 0) return null;
-
-  return Math.round(seconds * 10) / 10;
-}
-
 export function ReasoningStepPart({
   reasoning,
-  collapsedAdaptiveWidth = false,
   isFirst,
   isLast,
 }: ReasoningStepPartProps) {
@@ -90,20 +74,8 @@ export function ReasoningStepPart({
     setExpandState(nextExpanded ? ReasoningCardState.Expanded : ReasoningCardState.Collapsed);
   };
 
-  const [duration, setDuration] = React.useState<number | null>(() =>
-    formatDuration(reasoning.createdAt, reasoning.finishedAt),
-  );
-
-  React.useEffect(() => {
-    setDuration(formatDuration(reasoning.createdAt, reasoning.finishedAt));
-    if (!loading) return;
-    // 500ms 刷新足够(显示精度 0.1s,肉眼无差);原 100ms(10fps)会让推理消息持续
-    // 高频重渲染 + Markdown 重解析,是思考过程卡顿的放大器。
-    const id = setInterval(() => {
-      setDuration(formatDuration(reasoning.createdAt, reasoning.finishedAt));
-    }, 500);
-    return () => clearInterval(id);
-  }, [loading, reasoning.createdAt, reasoning.finishedAt]);
+  // 耗时口径与工具卡共用(useElapsedSeconds):不足 1 秒静默、定格进位显示 1 秒、1s tick。
+  const duration = useElapsedSeconds(reasoning.createdAt, reasoning.finishedAt);
 
   const preview = expandState === ReasoningCardState.Preview;
 
@@ -112,7 +84,6 @@ export function ReasoningStepPart({
       <ControlledChainOfThoughtStep
         expanded={expandState === ReasoningCardState.Expanded}
         onExpandedChange={onExpandedChange}
-        collapsedAdaptiveWidth={collapsedAdaptiveWidth}
         isFirst={isFirst}
         isLast={isLast}
         active={loading}
@@ -128,13 +99,13 @@ export function ReasoningStepPart({
             {showThinkingTitle
               ? thinkingTitle
               : duration !== null
-                ? t("message_parts.thinking_seconds", { seconds: duration.toFixed(1) })
+                ? t("message_parts.thinking_seconds", { seconds: duration })
                 : t("message_parts.deep_thinking")}
           </span>
         }
         extra={
           showThinkingTitle && duration !== null ? (
-            <span className="text-muted-foreground text-xs">{duration.toFixed(1)}s</span>
+            <span className="text-muted-foreground text-xs">{duration}s</span>
           ) : undefined
         }
         contentVisible={expandState !== ReasoningCardState.Collapsed}

@@ -1,17 +1,18 @@
 // conversations/orchestrator.ts — 会话生成编排（Provider 分发、流式工具循环挂接、生成主链路与收尾任务）
 // 纪律：纯搬迁自 server.ts（阶段 5.3g），行为不变。推理引擎经 GenerationEvent sink 与本层解耦。
 
-import type { ApiMessage, Assistant, Conversation, JsonValue, Message, MessageNode, Model, Provider, StreamHooks, ToolPendingOutput } from "../foundation/types";
+import type { ApiMessage, Assistant, Conversation, JsonValue, Message, MessageNode, Model, Provider, ToolPendingOutput } from "../foundation/types";
 import { bumpAnalyticsErrCount } from "../app-config/analytics";
-import type { GenerationEvent, GenerationEventSink, StreamHooksWithSink, ToolExecutor } from "../inference-engine/events";
+import type { GenerationEventSink, StreamHooksWithSink, ToolExecutor } from "../inference-engine/events";
 import { id, isRecord, message, textFromParts } from "../foundation/utils";
 import { classifyProxyError } from "../foundation/net";
-import { classifyContextOverflowError, classifyRateLimitError } from "../inference-engine/provider-errors";
+import { classifyContextOverflowError, classifyOutputCapError, classifyRateLimitError } from "../inference-engine/provider-errors";
 import { state } from "../persistence/json-store";
 import { addLog } from "../api/logs";
-import { broadcastConversation, broadcastList, broadcastNodeUpdate, touchStream } from "../api/sse";
+import { broadcastConversation, broadcastEngineStatus, broadcastList, broadcastNodeUpdate, touchStream } from "../api/sse";
 import { applyCustomBody, applyRequestHeaders, findModel } from "../model-providers";
 import { endpointFor } from "../model-providers/checks";
+import { openAiMaxTokensField, reasoningLevelNormalized } from "../model-providers/request-dialect";
 import {
   claudeCacheControlEphemeral,
   claudeMessagesFromApiMessages,
@@ -21,7 +22,6 @@ import {
   hostOfProvider,
   isModelAllowTemperature,
   openAiChatCompletionsModalities,
-  reasoningLevelNormalized,
   reasoningPayloadForProvider,
   responseApiBuiltInTools,
   responseApiIncludeForProvider,
@@ -36,32 +36,48 @@ import {
 } from "../inference-engine/conversation-encoding";
 import {
   fetchClaudeTextWithTools,
-  mergeTokenUsage,
   fetchOpenAiText,
   fetchOpenAiTextStreaming,
   fetchText,
+  modelsDevCache,
   streamClaudeChatWithTools,
   streamGoogleChatWithTools,
 } from "../inference-engine/providers";
+import { contextWindowFor, requiredOutputCap } from "../model-providers/model-limits";
 import {
-  addStreamImage,
-  addStreamText,
-  appendReasoningDelta,
   finishReasoningParts,
-  replaceLoadingReasoningWithTool,
   setMessageLoading,
   streamStartedMessages,
 } from "../inference-engine/parts";
-import { apiToolCallFromPart, resolvedToolOutput, toolExecutionErrorPayload } from "../tools/format";
-import { openAiLocalTools, openAiMcpTools, openAiSearchTools, openAiSkillTools } from "../tools/bound";
+import { createGenerationEventApplier } from "./generation-apply";
+import { apiToolCallFromPart, toolExecutionErrorPayload, toolResultTextForApi } from "../tools/format";
+import { conversationFunctionTools } from "../tools/bound";
 import { executeToolCall, realizeToolResult, toolResultToParts } from "../tools/execution";
+import type { WorkspaceRuntime } from "../workspace/runtime";
+import {
+  createEngineRegistry,
+  resolveEngine,
+  type EngineAdapter,
+  type EngineCompactContext,
+  type EngineCompactionResult,
+  type EngineKind,
+  type EngineRunContext,
+} from "../engines";
+import { MANUAL_COMPACT_KEEP_RECENT_TOKENS, runPiCompaction, runPiGeneration, type CapturedEngineCompaction } from "../pi-engine/runner";
+import { mapProviderModelToPi } from "../pi-engine/model-bridge";
+import { createPiWorkspaceTools } from "../pi-engine/workspace-tools";
+import { createPiGeneralTools } from "../pi-engine/general-tools";
+import { createPiSessionResources } from "../pi-engine/resources";
+import { piPromptInputFromParts } from "../pi-engine/attachments";
+import { effectiveEngineCompaction, type EngineCompactionRecord } from "../pi-engine/context-encoder";
+import { encodableMessages, enrichMessages, applyTemplateToMessage } from "../inference-engine/message-enrichment";
 import { applyOutputTransforms } from "../assistants";
 import { TITLE_CHARACTER_LIMIT } from "../app-config/prompts";
-import { flushConvDirtyNow, getConversation, getConversationsDb, markMessageNodeDirty, persistConversation, scheduleThrottledConvFlush } from "./index";
+import { flushConvDirtyNow, getConversation, getConversationsDb, markConversationRowDirty, markMessageNodeDirty, persistConversation, scheduleThrottledConvFlush, selectedConversationMessages } from "./index";
 import { checkoutConversation, releaseConversation } from "./working-set";
 import { conversationExistsInDb } from "./read-queries";
 import { reportError } from "../observability/app-errors";
-import { generating } from "./generation-state";
+import { awaitingApproval, generating } from "./generation-state";
 import {
   appendTextPart,
   canResumeToolExecution,
@@ -72,7 +88,7 @@ import {
   hasResumableToolParts,
   toolApprovalType,
 } from "./helpers";
-import { generateSuggestionsForConversation, generateTitleForConversation, limitAuxiliaryText, modelExists, shouldAutoGenerateTitle } from "./auxiliary";
+import { generateSuggestionsForConversation, generateTitleForConversation, limitAuxiliaryText, markCompactionBoundary, modelExists, shouldAutoGenerateTitle } from "./auxiliary";
 
 /** 生成入口一次性解析的配置快照（P1-4）。流式生成横跨多个 await 点，用户中途改配置
  *  （换模型/改工具集/删助手）时，updateSettings 会整体替换 state.settings——持有入口
@@ -125,7 +141,7 @@ export async function callProvider(
     const messages = messagesForApi;
     const systemContent = messages.find((item) => item.role === "system")?.content;
     const functionTools = supportsAbility(picked.model, "TOOL")
-      ? [...openAiSearchTools(), ...openAiLocalTools(assistant), ...openAiSkillTools(assistant), ...openAiMcpTools(assistant)]
+      ? conversationFunctionTools(assistant)
       : [];
     const claudeTools = claudeToolsFromOpenAiTools(functionTools, providerItem);
     const normalizedReasoning = reasoningLevelNormalized(assistant.reasoningLevel);
@@ -136,7 +152,12 @@ export async function callProvider(
     const canStream = hooks?.message != null;
     body = {
       model: selectedModel,
-      max_tokens: assistant.maxTokens ?? 64_000,
+      // 上限四级(requiredOutputCap 单源,与工作区引擎同一函数):助手设置 > 目录真实
+      // 输出上限(按端点身份查,拒 output≥context 的占位行)> 方言兜底,再收进窗口。
+      // Anthropic 协议 max_tokens 必填,所以这条路必须给数——但绝不能给"名字撞来的"数:
+      // 2026-09-09 智谱 GLM-5.3 的 1210 报障就是旧查表在 213 个目录里撞到某转售商的
+      // {context:1048576, output:1048576} 占位行,把窗口尺寸当输出上限发了出去。
+      max_tokens: requiredOutputCap(modelsDevCache, providerItem, picked.model.modelId, assistant.maxTokens),
       stream: canStream,
       system: claudeSystemContent(systemContent, providerItem),
       messages: claudeMessagesFromApiMessages(messages, providerItem),
@@ -159,7 +180,7 @@ export async function callProvider(
 
   headers.Authorization = `Bearer ${providerItem.apiKey}`;
   if (providerItem.useResponseApi) {
-    const functionTools = supportsAbility(picked.model, "TOOL") ? [...openAiSearchTools(), ...openAiLocalTools(assistant), ...openAiSkillTools(assistant), ...openAiMcpTools(assistant)] : [];
+    const functionTools = supportsAbility(picked.model, "TOOL") ? conversationFunctionTools(assistant) : [];
     const builtInTools = responseApiBuiltInTools(picked.model);
     const systemContent = conversationResponseApiInstructions(conversation, assistant);
     const reasoning = responseApiReasoningForProvider(providerItem, picked.model, assistant.reasoningLevel);
@@ -189,13 +210,15 @@ export async function callProvider(
     if (!body.tools.length) delete body.tools;
     return fetchText(url, headers, applyCustomBody(body, assistant, picked.model), providerItem, (raw) => raw.output_text ?? raw.output?.flatMap((item: any) => item.content ?? []).map((item: any) => item.text ?? "").join("\n"), signal);
   }
-  const tools = supportsAbility(picked.model, "TOOL") ? [...openAiSearchTools(), ...openAiLocalTools(assistant), ...openAiSkillTools(assistant), ...openAiMcpTools(assistant)] : [];
+  const tools = supportsAbility(picked.model, "TOOL") ? conversationFunctionTools(assistant) : [];
   body = {
     model: selectedModel,
     messages: messagesForApi,
     temperature: isModelAllowTemperature(picked.model) ? assistant.temperature ?? undefined : undefined,
     top_p: isModelAllowTemperature(picked.model) ? assistant.topP ?? undefined : undefined,
-    max_tokens: assistant.maxTokens ?? undefined,
+    // 上限字段名走统一请求方言（model-providers/request-dialect）：官方 OpenAI 口
+    // max_completion_tokens（o 系硬要求），其余 max_tokens（第三方对未知字段静默忽略）。
+    ...(assistant.maxTokens != null ? { [openAiMaxTokensField(hostOfProvider(providerItem))]: assistant.maxTokens } : {}),
     ...(providerItem.type === "openai" ? { modalities: openAiChatCompletionsModalities(picked.model, providerItem) } : {}),
     ...reasoningPayloadForProvider(providerItem, picked.model, assistant.reasoningLevel),
     tools: tools.length ? tools : undefined,
@@ -231,7 +254,7 @@ export async function callProviderStreaming(
     // 默认 true，仅当用户显式关闭时才不回传历史 reasoning_content。
     providerItem.type === "openai" ? providerItem.includeHistoryReasoning !== false : true,
   );
-  const tools = supportsAbility(picked.model, "TOOL") ? [...openAiSearchTools(), ...openAiLocalTools(assistant), ...openAiSkillTools(assistant), ...openAiMcpTools(assistant)] : [];
+  const tools = supportsAbility(picked.model, "TOOL") ? conversationFunctionTools(assistant) : [];
   const hooks: StreamHooksWithSink = {
     message: assistantMessage,
     conversation,
@@ -277,7 +300,8 @@ export async function callProviderStreaming(
     messages: messagesForApi,
     temperature: isModelAllowTemperature(picked.model) ? assistant.temperature ?? undefined : undefined,
     top_p: isModelAllowTemperature(picked.model) ? assistant.topP ?? undefined : undefined,
-    max_tokens: assistant.maxTokens ?? undefined,
+    // 上限字段名走统一请求方言（与非流式路径同一行注释所指）。
+    ...(assistant.maxTokens != null ? { [openAiMaxTokensField(hostOfProvider(providerItem))]: assistant.maxTokens } : {}),
     ...(providerItem.type === "openai" ? { modalities: openAiChatCompletionsModalities(picked.model, providerItem) } : {}),
     ...reasoningPayloadForProvider(providerItem, picked.model, assistant.reasoningLevel),
     tools: tools.length ? tools : undefined,
@@ -289,14 +313,20 @@ export async function callProviderStreaming(
   return fetchOpenAiTextStreaming(url, headers, body, providerItem, assistant, hooks, ctx.signal);
 }
 
-export async function executeApprovedToolPart(part: Record<string, JsonValue>, assistant: Assistant) {
+export async function executeApprovedToolPart(
+  part: Record<string, JsonValue>,
+  assistant: Assistant,
+  context?: { conversationId?: string; messageNodeId?: string; signal?: AbortSignal },
+) {
   const approvalType = toolApprovalType(part);
   if (approvalType === "answered") return String((part.approvalState as Record<string, JsonValue>)?.answer ?? "");
   if (approvalType === "denied") {
     const reason = String((part.approvalState as Record<string, JsonValue>)?.reason ?? "").trim() || "No reason provided";
     return { error: `Tool execution denied by user. Reason: ${reason}` };
   }
-  return executeToolCall(apiToolCallFromPart(part), assistant);
+  // 走到这里 = 用户对 pending 卡显式批准：userApproved 是危险命令拦截的
+  // 知情同意放行门（workspace/runtime.ts），仅此路径可置 true。
+  return executeToolCall(apiToolCallFromPart(part), assistant, { ...context, userApproved: true });
 }
 
 export async function resumeApprovedToolParts(
@@ -305,6 +335,7 @@ export async function resumeApprovedToolParts(
   assistantMessage: Message,
   assistantNode: MessageNode,
   useResponseInput: boolean,
+  signal?: AbortSignal,
 ) {
   const toolMessages: ApiMessage[] = [];
   let changed = false;
@@ -314,7 +345,11 @@ export async function resumeApprovedToolParts(
     if (!canResumeToolExecution(part)) continue;
     let toolResult: unknown;
     try {
-      toolResult = await executeApprovedToolPart(part, assistant);
+      toolResult = await executeApprovedToolPart(part, assistant, {
+        conversationId: conversation.id,
+        messageNodeId: assistantNode.id,
+        signal,
+      });
     } catch (err) {
       toolResult = toolExecutionErrorPayload(err);
     }
@@ -323,8 +358,8 @@ export async function resumeApprovedToolParts(
     changed = true;
     toolMessages.push(
       useResponseInput
-        ? { type: "function_call_output", call_id: String(part.toolCallId ?? ""), output: resolvedToolOutput(part) }
-        : { role: "tool", tool_call_id: String(part.toolCallId ?? ""), content: resolvedToolOutput(part) },
+        ? { type: "function_call_output", call_id: String(part.toolCallId ?? ""), output: toolResultTextForApi(part) }
+        : { role: "tool", tool_call_id: String(part.toolCallId ?? ""), content: toolResultTextForApi(part) },
     );
   }
   if (changed) {
@@ -441,31 +476,314 @@ async function runPostGenerationTasks(conversationId: string, snapshot: Conversa
   }
 }
 
-/** 纯生成逻辑：驱动 Provider 流式/非流式调用，并通过 sink 发出生成事件。
+/** pi 模型极限取值(P5 统计与压缩对齐):contextWindow 从 models.dev 查真实窗口
+ *  (决定 pi 自动压缩阈值),maxTokens 走 requiredOutputCap —— 与聊天引擎 Claude 分支
+ *  **同一个函数**,不是"同源口径"的口头约定。pi 的模型配置要求必须给出 maxTokens
+ *  (它会恒发上限字段),所以这里同样属于"协议逼我给数"的场合。 */
+function piModelLimitsFor(provider: Provider, model: Model, assistant: Assistant) {
+  return {
+    contextWindow: contextWindowFor(modelsDevCache, provider, model.modelId),
+    maxTokens: requiredOutputCap(modelsDevCache, provider, model.modelId, assistant.maxTokens),
+  };
+}
+
+/** P7:conversation.engineCompactions(DB 任意 JSON)→ 编码器契约。宽容校验:
+ *  坏条目丢弃而不是整列作废(与列解析"损坏回 null"同哲学)。 */
+function parseEngineCompactions(raw: JsonValue[] | null | undefined): EngineCompactionRecord[] {
+  const records: EngineCompactionRecord[] = [];
+  for (const item of raw ?? []) {
+    if (!isRecord(item)) continue;
+    if (typeof item.cutMessageId !== "string" || typeof item.summary !== "string") continue;
+    const record: EngineCompactionRecord = {
+      cutMessageId: item.cutMessageId,
+      summary: item.summary,
+      tokensBefore: typeof item.tokensBefore === "number" ? item.tokensBefore : 0,
+    };
+    if (typeof item.createdAt === "string") record.createdAt = item.createdAt;
+    records.push(record);
+  }
+  return records;
+}
+
+/** P7:本轮压缩产物落 conversation.engineCompactions。cutMessageId 为 null(pi 自动压缩
+ *  的切点可能落在本轮 prompt 之后,而本轮消息尚未入库)按"外收拢"落当前尾消息
+ *  id——只多保不少保,下一轮编码器按"切点在场"自校验生效。 */
+function applyCapturedEngineCompactions(conversation: Conversation, captured: CapturedEngineCompaction[]): void {
+  if (!captured.length) return;
+  const tail = selectedConversationMessages(conversation).at(-1);
+  const records = parseEngineCompactions(conversation.engineCompactions);
+  for (const item of captured) {
+    const cutMessageId = item.cutMessageId ?? tail?.id;
+    if (!cutMessageId) continue; // 无任何消息可挂靠(理论不可达):丢记录好过写错切点
+    records.push({
+      cutMessageId,
+      summary: item.summary,
+      tokensBefore: item.tokensBefore,
+      createdAt: new Date().toISOString(),
+    });
+  }
+  conversation.engineCompactions = records as unknown as JsonValue[];
+  // 压缩发生点外显:分割线锚定"压缩时刻的最新消息"(自动/手动压缩同点生效)。
+  markCompactionBoundary(conversation);
+  markConversationRowDirty(conversation.id);
+  scheduleThrottledConvFlush();
+}
+
+/** pi 引擎生成装配(P3 路由 + P4 资源统一 + P7 会话数据统一 + P8/P9 注入面统一)。
+ *  T1 起收敛为 pi adapter 的 run 实现:输入是引擎无关 EngineRunContext + pi 专属
+ *  piRuntime(由 adapter 在 matches() 判定后透传)。
+ *  - prompt 输入取末 USER 节点选中消息(P4 附件面:文档/OCR 文本化与聊天引擎同母本,
+ *    图片走 pi 原生 images 通道);prompt 文本经消息模板渲染(四件套之一);
+ *  - 引擎上下文 = 编码器从富化后的选中路径历史(不含本轮 prompt 消息)确定性重建,
+ *    压缩记录从 conversation.engineCompactions 进同一灌注——重新生成/编辑重发/分支切换
+ *    天然生效(UI 选中路径就是引擎记忆,所见即所记);
+ *  - 消息富化 = enrichMessages(四件套共享层):模板/时间提醒/lorebook+模式注入/
+ *    窗口化(滞回截断 ∨ 压缩切点锚,P9)——聊天位注入/时间提醒随富化全序列(含
+ *    合成行)灌进 pi 引擎,与聊天引擎逐字同生效;合成行由 syntheticIds 标出,编码器
+ *    挡在切点映射/退化诊断外;系统位注入经 appendSystemPrompt 进 pi 系统面;
+ *  - 工具面 = 七个工作区工具 + 通用工具/MCP 桥(P4),审批全部内化在工具 execute;
+ *  - 资源面 = createPiSessionResources(技能白名单/AGENTS.md 边界过滤/人设+记忆冻结
+ *    appendSystemPrompt/受控 settings)。 */
+async function runPiWorkspaceGeneration(
+  ctx: EngineRunContext & { piRuntime: WorkspaceRuntime | null },
+  sink: GenerationEventSink,
+  signal?: AbortSignal,
+): Promise<string> {
+  const { conversation, assistantNode } = ctx;
+  const runtime = ctx.piRuntime;
+  if (!runtime) {
+    // 路由不变式:resolveEngine 选中 pi 时 matches() 已确认工作区可用。此处为防御兜底
+    // (adapter WeakMap 透传被回收的极端情况)——不可达于正常路径,报错好过静默走错引擎。
+    throw new Error("pi 引擎被选中但工作区运行时不可用(路由判定与执行不一致)。");
+  }
+  const deps = { assistant: ctx.assistant, providerItem: ctx.provider, selectedModel: ctx.model };
+  const lastUserNode = [...conversation.messages]
+    .reverse()
+    .find((node) => (node.messages[node.selectIndex] ?? node.messages[0])?.role === "USER");
+  const promptMessage = lastUserNode ? (lastUserNode.messages[lastUserNode.selectIndex] ?? lastUserNode.messages[0]) : null;
+  // prompt 文本先经消息模板渲染(与历史消息同一富化口径),再走附件文本化。
+  const template = deps.assistant.messageTemplate?.trim() || "{{ message }}";
+  const templatedPromptParts = promptMessage
+    ? applyTemplateToMessage(promptMessage, template, "user", deps.assistant, deps.selectedModel)
+    : [];
+  const promptInput = promptMessage
+    ? piPromptInputFromParts(templatedPromptParts, deps.selectedModel)
+    : { text: "", images: [] };
+  if (!promptInput.text && !promptInput.images.length) {
+    // 无文本且无图片输入直接走失败分支给出人话。
+    throw new Error("工作区会话缺少可发送的用户消息内容,无法驱动工作区引擎。");
+  }
+
+  // 四件套富化(P9 灌注统一):历史消息(不含本轮 prompt)经共享层裁决;压缩切点
+  // (effectiveEngineCompaction 单源判定)作为富化窗口锚——注入行/提醒恒在窗口内、恒在
+  // 切点之后:既进模型视野,又永不落进被摘要吸收的旧历史。富化全序列(含合成行)
+  // 进引擎,每轮从 DB 原文重新裁决,DB 零沉淀。
+  const historySource = selectedConversationMessages(conversation).filter((msg) => msg.id !== promptMessage?.id);
+  const compactionRecords = parseEngineCompactions(conversation.engineCompactions);
+  const cut = effectiveEngineCompaction(compactionRecords, historySource, deps.selectedModel);
+  const enriched = enrichMessages(historySource, {
+    conversation,
+    assistant: deps.assistant,
+    model: deps.selectedModel,
+    windowStartMessageId: cut?.cutMessageId,
+  });
+
+  // 系统位注入(before/after_system_prompt)经 appendSystemPrompt 进 pi 系统面——
+  // 与人设/记忆/搜索指引同一插槽,位置在 pi Guidelines 之后、project_context 之前。
+  const systemInjection = [enriched.systemInjectionBefore, enriched.systemInjectionAfter].filter(Boolean).join("\n");
+  const resources = await createPiSessionResources({
+    conversation,
+    assistant: deps.assistant,
+    model: deps.selectedModel,
+    cwd: runtime.cwd,
+    root: runtime.root,
+    extraAppendSystemPrompt: systemInjection ? [systemInjection] : undefined,
+  });
+
+  const result = await runPiGeneration({
+    provider: deps.providerItem,
+    model: deps.selectedModel,
+    modelLimits: piModelLimitsFor(deps.providerItem, deps.selectedModel, deps.assistant),
+    // 思考强度与聊天引擎同源(助手设置);pi 档位翻译见 model-bridge piThinkingLevelFor。
+    reasoningLevel: deps.assistant.reasoningLevel,
+    conversationId: conversation.id,
+    cwd: runtime.cwd,
+    history: enriched.messages,
+    syntheticIds: enriched.syntheticIds,
+    compactions: compactionRecords,
+    promptText: promptInput.text,
+    images: promptInput.images,
+    resources,
+    tools: [
+      ...createPiWorkspaceTools({ conversation, assistant: deps.assistant, sink }),
+      ...createPiGeneralTools({ conversation, assistant: deps.assistant, sink, messageNodeId: assistantNode.id }),
+    ],
+    sink,
+    signal,
+  });
+  applyCapturedEngineCompactions(conversation, result.capturedCompactions);
+  return result.text;
+}
+
+/** 引擎注册表(T1):编排器把各引擎的生成/压缩实现注入 adapter 工厂。pi 在前(工作区
+ *  可用即接管),chat 兜底。新增引擎在此注册一行,runGeneration/续跑语义/压缩路由/
+ *  审批旁路判定无需再改。 */
+const ENGINE_REGISTRY = createEngineRegistry({
+  chatRun: (ctx, sink, signal) =>
+    callProviderStreaming(ctx.conversation, ctx.assistantMessage, ctx.assistantNode, {
+      signal,
+      sink,
+      executeTool: ctx.executeTool,
+      // P1-4:generateAnswer 入口解析的 assistant/provider/model 贯穿本次生成,
+      // callProviderStreaming 不再从可能已被替换的 state.settings 重新解析。
+      snapshot: { assistant: ctx.assistant, provider: ctx.provider, model: ctx.model },
+    }),
+  piRun: (ctx, sink, signal) => runPiWorkspaceGeneration(ctx, sink, signal),
+  piCompact: (ctx, sink, signal) => runPiWorkspaceCompaction(ctx, sink, signal),
+});
+
+/** 纯生成逻辑：经引擎注册表分发到命中 adapter,由 sink 发出生成事件。
  *  本函数不直接写 state.json、不直接广播 SSE、不直接落盘 SQLite——这些副作用由
  *  协调器 generateAnswer 统一处理。 */
 async function runGeneration(
-  conversation: Conversation,
-  assistantMessage: Message,
-  assistantNode: MessageNode,
-  deps: {
-    assistant: Assistant;
-    providerItem: Provider;
-    selectedModel: Model;
-    executeTool: ToolExecutor;
-  },
+  deps: EngineRunContext & { adapter: EngineAdapter },
   sink: GenerationEventSink,
   signal?: AbortSignal,
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException("Generation stopped", "AbortError");
-  return callProviderStreaming(conversation, assistantMessage, assistantNode, {
+  // T1:布尔路由退役——引擎选择已收敛为 resolveEngine 选出的 adapter.run。pi 专属
+  // 决策(piRuntime)由 pi adapter 在 matches()/run() 内部携带,不再污染本层。
+  return deps.adapter.run(deps, sink, signal);
+}
+
+/** pi 引擎压缩装配(P5 原生 compaction + P7 产物落 engineCompactions)。压缩路由收编:
+ *  收敛为 pi adapter 的 compact 实现——路由判定(工作区可用)已由 matches() 承担,
+ *  本函数只管驱动;engine_status 经调用方注入的 sink 直通,广播与终局清条不在此层。
+ *  压缩的对象是"模型实际看到的消息":与生成路径同一富化裁决(模板/提醒/注入),
+ *  但合成消息经 encodableMessages 剥回纯真实行(P9)——手动压缩是用户策展行为,
+ *  摘要只覆盖真实对话;注入是配置不是对话,时间提醒只描述节奏,均不进摘要。
+ *  窗口锚照常生效:切点前的历史已被上一轮摘要吸收,压缩对象从切点起即可。 */
+async function runPiWorkspaceCompaction(
+  ctx: EngineCompactContext & { piRuntime: WorkspaceRuntime | null },
+  sink: GenerationEventSink,
+  signal?: AbortSignal,
+): Promise<EngineCompactionResult> {
+  const { conversation, assistant } = ctx;
+  const runtime = ctx.piRuntime;
+  if (!runtime) {
+    // 路由不变式:resolveEngine 选中 pi 时 matches() 已确认工作区可用。此处为防御兜底
+    // (与 runPiWorkspaceGeneration 同一防御)——不可达于正常路径,报错好过静默走错引擎。
+    throw new Error("pi 引擎被选中但工作区运行时不可用(路由判定与执行不一致)。");
+  }
+  const compactionRecords = parseEngineCompactions(conversation.engineCompactions);
+  const cut = effectiveEngineCompaction(compactionRecords, selectedConversationMessages(conversation), ctx.model);
+  const enriched = enrichMessages(selectedConversationMessages(conversation), {
+    conversation,
+    assistant,
+    model: ctx.model,
+    windowStartMessageId: cut?.cutMessageId,
+  });
+  const history = encodableMessages(enriched.messages, enriched.syntheticIds);
+  const systemInjection = [enriched.systemInjectionBefore, enriched.systemInjectionAfter].filter(Boolean).join("\n");
+  const resources = await createPiSessionResources({
+    conversation,
+    assistant,
+    model: ctx.model,
+    cwd: runtime.cwd,
+    root: runtime.root,
+    extraAppendSystemPrompt: systemInjection ? [systemInjection] : undefined,
+    // 手动压缩门槛/保留窗口调低(中文 chars/4 低估问题,rationale 见 runner.ts 常量)。
+    compactionKeepRecentTokens: MANUAL_COMPACT_KEEP_RECENT_TOKENS,
+  });
+  // 摘要模型:公共压缩模型优先(ctx.summarizer,装配点已决策),pi 映射不进(自定义
+  // 补全路径的 openai 型服务商等)则回退会话模型——公共设置是偏好不是硬约束,
+  // 压缩必须总能进行,回退留 warn 让用户知情。注意窗口锚定/富化裁决(上方 cut/
+  // enriched)仍按 ctx.model:压缩对象是"会话模型实际看到的消息",与生成路径同一
+  // 视角,勿随摘要模型漂移。
+  let summarizer = ctx.summarizer;
+  if (summarizer.model.id !== ctx.model.id && !mapProviderModelToPi(summarizer.provider, summarizer.model).ok) {
+    reportError(
+      "provider",
+      "warn",
+      `压缩模型 ${summarizer.model.displayName || summarizer.model.modelId} 无法在工作区引擎使用,本次压缩改用会话模型`,
+      undefined,
+      "compact_summarizer_fallback",
+    );
+    summarizer = { provider: ctx.provider, model: ctx.model };
+  }
+  const result = await runPiCompaction({
+    provider: summarizer.provider,
+    model: summarizer.model,
+    modelLimits: piModelLimitsFor(summarizer.provider, summarizer.model, assistant),
+    reasoningLevel: assistant.reasoningLevel,
+    conversationId: conversation.id,
+    cwd: runtime.cwd,
+    history,
+    compactions: compactionRecords,
+    resources,
+    customInstructions: ctx.customInstructions,
     signal,
     sink,
-    executeTool: deps.executeTool,
-    // P1-4：generateAnswer 入口解析的 assistant/provider/model 贯穿本次生成，
-    // callProviderStreaming 不再从可能已被替换的 state.settings 重新解析。
-    snapshot: { assistant: deps.assistant, provider: deps.providerItem, model: deps.selectedModel },
   });
+  // 产物落库是引擎注入实现的义务——与生成路径的压缩捕获同一落点、同一 helper。
+  applyCapturedEngineCompactions(conversation, [result.compaction]);
+  return result;
+}
+
+/** 引擎原生压缩入口(压缩路由收编:经注册表分发,与生成路由同源)。返回 null =
+ *  命中引擎未声明 compact 能力(chat 无引擎记忆)——调用方回落 UI 历史压缩(聊天
+ *  引擎从 UI 历史构建请求,压 UI 历史即压上下文)。工作区不可用(缺根/未信任)时
+ *  pi 的 matches() 不命中、落到 chat 兜底,同样回落——与生成路由的降级天然一致。
+ *  压缩期间 engine_status 直通状态条,finally 兜底清除(取消/失败不挂"压缩中");
+ *  瞬态状态的「怎么发」是引擎的事(经 sink),「怎么播/怎么兜底清」是本层的事,
+ *  与 generateAnswer 的 sink 职责划分一致。 */
+export async function compactEngineConversation(
+  conversation: Conversation,
+  customInstructions: string,
+  signal?: AbortSignal,
+): Promise<{ engine: EngineKind; summary: string; tokensBefore: number; estimatedTokensAfter: number | null } | null> {
+  const assistant = findAssistant(conversation.assistantId);
+  const adapter = resolveEngine(ENGINE_REGISTRY, conversation, assistant);
+  if (!adapter.compact) return null;
+  const picked = findModel(assistant.chatModelId ?? state.settings.chatModelId);
+  // 压缩模型公共化(「设置-默认模型与提示词」是公共基础设施):配置了压缩模型则
+  // 所有引擎的摘要生成都用它,未配置回退会话模型。modelExists 先行:压缩模型被
+  // 删除后设置残留 id 不该改变语义(findModel 对不存在 id 会兜底 chatModelId,
+  // 那是"默认聊天模型"不是"用户指定的压缩模型",宁可回退会话模型)。
+  const summarizerPicked = modelExists(state.settings.compressModelId)
+    ? findModel(state.settings.compressModelId)
+    : picked;
+  try {
+    const result = await adapter.compact(
+      {
+        conversation,
+        assistant,
+        provider: picked.provider,
+        model: picked.model,
+        summarizer: { provider: summarizerPicked.provider, model: summarizerPicked.model },
+        customInstructions,
+      },
+      (event) => {
+        if (event.kind === "engine_status") broadcastEngineStatus(conversation.id, event.status);
+      },
+      signal,
+    );
+    return {
+      engine: adapter.kind,
+      summary: result.summary,
+      tokensBefore: result.tokensBefore,
+      estimatedTokensAfter: result.estimatedTokensAfter,
+    };
+  } finally {
+    broadcastEngineStatus(conversation.id, { busy: false });
+  }
+}
+
+/** 会话的引擎判定(注册表路由的只读查询)。编排器外的消费点(审批端点等)用它替代
+ *  自行判定(如以"工作区可用"旁路推断引擎),保证与生成/压缩路由永远同源——
+ *  第三引擎接入时这些消费点自动跟随注册表,无需再改。 */
+export function resolveEngineForConversation(conversation: Conversation): EngineAdapter {
+  return resolveEngine(ENGINE_REGISTRY, conversation, findAssistant(conversation.assistantId));
 }
 
 export async function generateAnswer(conversation: Conversation, regenerateAtNodeId?: string) {
@@ -483,6 +801,11 @@ export async function generateAnswer(conversation: Conversation, regenerateAtNod
   checkoutConversation(conversation.id);
   const assistant = findAssistant(conversation.assistantId);
   const picked = findModel(assistant.chatModelId ?? state.settings.chatModelId);
+  // T1:路由在入口一次判定并贯穿本次生成(与 P1-4 配置快照同理)——引擎选择收敛为
+  // 注册表 resolveEngine(pi 命中工作区三道闸即接管,否则 chat 兜底)。续跑/暂停语义
+  // 不再写死 "!piRuntime",改读 adapter.resumeSemantics。
+  const adapter = resolveEngine(ENGINE_REGISTRY, conversation, assistant);
+  const isRunAndSuspend = adapter.resumeSemantics === "run-and-suspend";
   // 重新生成 ASSISTANT:调用方已在该 node 追加空占位 message 并把 selectIndex 指向它,
   // 直接复用,绕开 ensureAssistantGenerationNode(它会复用末尾 assistant 或新建 node,
   // 都不是"在指定 node 上新增分支")。find 不到时安全回退到默认逻辑。
@@ -513,7 +836,9 @@ export async function generateAnswer(conversation: Conversation, regenerateAtNod
     broadcastNodeUpdate(conversation, assistantNode);
     broadcastConversation(conversation);
   };
-  const resumingApprovedTools = hasResumableToolParts(currentMessage);
+  // T1:续跑语义读 adapter 声明——仅 pause-resume 引擎(聊天)有"整批暂停→逐卡批准→
+  // 重触发续跑";run-and-suspend 引擎(pi)的工具审批由 approval-gate 挂起汇合,不重触发。
+  const resumingApprovedTools = adapter.resumeSemantics === "pause-resume" && hasResumableToolParts(currentMessage);
   currentMessage.finishedAt = null;
   // R7-2:重入生成(续写/重试复用同一消息对象)时清掉上一轮的失败标记,
   // 本轮成功后前端错误横幅不再残留;本轮再失败会在 catch 里重新落标记。
@@ -539,13 +864,19 @@ export async function generateAnswer(conversation: Conversation, regenerateAtNod
   broadcastNodeUpdate(conversation, assistantNode);
   try {
     if (resumingApprovedTools) {
-      await resumeApprovedToolParts(conversation, assistant, currentMessage, assistantNode, false);
+      await resumeApprovedToolParts(conversation, assistant, currentMessage, assistantNode, false, controller.signal);
     }
     // 工具执行闭包：把 server.ts 里的 executeToolCall 包装成 ToolExecutor 接口。
     // 这里保留对全局 state 的读写（如 saveToolBinaryContent），因为协调器仍然是唯一拥有
     // state 写权限的层；后续 Phase 会再把文件落盘拆到 files/ 模块。
     const executeTool: ToolExecutor = async (toolCall, context) => {
-      const raw = await executeToolCall(toolCall, assistant, context);
+      // 注入生成级 signal（工作区工具据此取消，bash 连杀进程树）与部分输出回写
+      // （bash 执行中把尾部输出写进 tool part，走现有 touchStream 合帧管线）。
+      const raw = await executeToolCall(toolCall, assistant, {
+        ...context,
+        signal: controller.signal,
+        onToolPartialOutput: (output) => applyEvent({ kind: "tool_result", toolCallId: toolCall.id, output }),
+      });
       // ask_user / MCP 审批等 pending 状态直接作为单 output 载荷返回，让协调器走暂停路径。
       if (isRecord(raw) && "pending" in raw) {
         return { output: [raw as unknown as ToolPendingOutput] };
@@ -554,67 +885,34 @@ export async function generateAnswer(conversation: Conversation, regenerateAtNod
       const output = await realizeToolResult(normalized);
       return { output };
     };
-    const applyEvent = (event: GenerationEvent) => {
-      const streamHooks: StreamHooks = { message: currentMessage, conversation, node: assistantNode };
-      switch (event.kind) {
-        // 文本/思维链/图片增量写入内存后必须 touchStream(标脏 + 200ms 节流落库 + 33ms 节流
-        // 广播),与下方三个 tool case 对齐。5.3g 搬迁时该调用曾丢失(收官审查 P0-2):无工具
-        // 会话全程无增量帧、无增量落库,流式中崩溃丢整段回答。
-        case "text_delta":
-          addStreamText(streamHooks, event.text);
-          touchStream(streamHooks as StreamHooksWithSink);
-          break;
-        case "reasoning_delta":
-          appendReasoningDelta(streamHooks as StreamHooksWithSink, event.text, event.metadata);
-          touchStream(streamHooks as StreamHooksWithSink);
-          break;
-        case "image_delta":
-          addStreamImage(streamHooks, event.url, event.metadata);
-          touchStream(streamHooks as StreamHooksWithSink);
-          break;
-        case "tool_call_created":
-          finishReasoningParts(currentMessage);
-          replaceLoadingReasoningWithTool(currentMessage, {
-            type: "tool",
-            toolCallId: event.toolCallId,
-            toolName: event.toolName,
-            input: event.input,
-            output: [],
-            approvalState: event.approvalState,
-          });
-          touchStream(streamHooks as StreamHooksWithSink);
-          break;
-        case "tool_input_delta":
-          currentMessage.parts = currentMessage.parts.map((part) => {
-            if (!isRecord(part) || part.type !== "tool" || part.toolCallId !== event.toolCallId) return part;
-            return { ...part, input: event.input };
-          });
-          touchStream(streamHooks as StreamHooksWithSink);
-          break;
-        case "tool_result":
-          currentMessage.parts = currentMessage.parts.map((part) => {
-            if (!isRecord(part) || part.type !== "tool" || part.toolCallId !== event.toolCallId) return part;
-            return { ...part, output: event.output };
-          });
-          touchStream(streamHooks as StreamHooksWithSink);
-          break;
-        case "usage":
-          // P1-3:多轮工具调用时每轮都发 usage 事件,merge 防后轮缺字段清零已知值。
-          currentMessage.usage = mergeTokenUsage(currentMessage.usage, event.usage);
-          break;
+    // P2(pi 引擎):内联 applyEvent 抽取为共享应用器(conversations/generation-apply.ts,
+    // 逐字搬迁行为零变)——聊天引擎与 pi 事件桥共用同一份"事件→parts"写入字典。
+    const applyEvent = createGenerationEventApplier({ conversation, node: assistantNode, message: currentMessage });
+    const sink: GenerationEventSink = (event) => {
+      // P5:引擎瞬态状态(压缩中/自动重试)不落库不产 part,直通会话 SSE 状态条;
+      // 其余事件照走应用器。generateAnswer finally 兜底 busy:false,中途 abort 不挂条。
+      if (event.kind === "engine_status") {
+        broadcastEngineStatus(conversation.id, event.status);
+        return;
       }
+      applyEvent(event);
     };
-    const sink: GenerationEventSink = (event) => applyEvent(event);
     const content = await runGeneration(
-      conversation,
-      currentMessage,
-      assistantNode,
-      { assistant, providerItem: picked.provider, selectedModel: picked.model, executeTool },
+      {
+        conversation,
+        assistantMessage: currentMessage,
+        assistantNode,
+        assistant,
+        provider: picked.provider,
+        model: picked.model,
+        executeTool,
+        adapter,
+      },
       sink,
       controller.signal,
     );
     if (controller.signal.aborted) throw new DOMException("Generation stopped", "AbortError");
-    if (hasPendingToolApproval(currentMessage)) {
+    if (adapter.resumeSemantics === "pause-resume" && hasPendingToolApproval(currentMessage)) {
       // 注:hasPendingToolApproval 判定在 applyOutputTransforms 之前与旧实现一致——
       // 旧实现先 transform 再判定,但 transform 只改 text/reasoning parts,不触碰 tool
       // parts 的 approvalState,判定结果不受影响;两分支的 transform 都由 finalize 统一做。
@@ -658,24 +956,35 @@ export async function generateAnswer(conversation: Conversation, regenerateAtNod
     bumpAnalyticsErrCount();
     const rawContent = err instanceof Error ? err.message : String(err);
     const proxyHint = classifyProxyError(err, state.settings.proxyConfig);
-    const failureText = proxyHint ?? classifyContextOverflowError(err) ?? classifyRateLimitError(err) ?? `请求失败：${rawContent}`;
-    // P2-1(N-7 归宿):失败文本除了写进会话消息(仅会话 SSE 可见),还上报全局通道——
+    const failureText =
+      proxyHint
+      ?? classifyContextOverflowError(err)
+      ?? classifyOutputCapError(err)
+      ?? classifyRateLimitError(err)
+      ?? `请求失败：${rawContent}`;
+    // P2-1(N-7 归宿):失败文本除了落在消息注解上(仅会话内可见),还上报全局通道——
     // 用户不在该会话页时也能收到通知(批2 接前端 toast)。
     reportError("provider", "error", failureText, err);
     finalizeOutcome(() => {
-      if (currentMessage.parts.length === 0) {
-        finishMessage(currentMessage, [{ type: "text", text: failureText }]);
-      } else {
-        appendTextPart(currentMessage, `\n\n${failureText}`);
-        currentMessage.finishedAt = new Date().toISOString();
-      }
-      // R7-2:结构化错误标记——前端"打开模型设置"横幅由它驱动,
+      // 错误零污染正文(对齐 Android addError):失败详情只活在 model_call_error 注解的
+      // message 字段,由前端错误卡呈现;正文保留半截真实产出。既无正文也无错误的流
+      // (中止/纯失败)不会走到这里——中止分支已先行返回。
+      currentMessage.finishedAt = new Date().toISOString();
+      // R7-2:结构化错误标记——前端错误卡由它驱动,详情取注解的 message 字段,
       // 不再对正文做关键词正则(讨论 HTTP 状态码/超时的正常回答不误报)。
       currentMessage.annotations.push({ type: "model_call_error", message: failureText });
     });
   } finally {
     releaseConversation(conversation.id);
     completeConversationGeneration(conversation.id, controller);
+    // P5:生成终局兜底清引擎状态条——压缩/重试进行中 abort/失败时,end 事件可能永远
+    // 不来,不清会挂死"压缩中"。幂等,聊天引擎路径广播空集合无副作用。T1:判定改读
+    // resumeSemantics——只有 run-and-suspend 引擎(pi)会发瞬态状态条,聊天引擎不发。
+    if (isRunAndSuspend) broadcastEngineStatus(conversation.id, { busy: false });
+    // 域4-1:审批等待注册表兜底清除——gateToolApproval 的正常路径(决定/中止)已注销,
+    // 这里是"生成终局但审批仍挂着"的防御(引擎 run 因故结束而 execute 未走到注销)。
+    // 幂等(delete 不存在键无副作用),与 busy:false 同点收口。
+    awaitingApproval.delete(conversation.id);
     if (!conversationStillExists(conversation.id)) return;
     broadcastNodeUpdate(conversation, assistantNode);
     broadcastConversation(conversation);
@@ -702,7 +1011,3 @@ export function ensureAssistantGenerationNode(conversation: Conversation, modelI
   scheduleThrottledConvFlush();
   return assistantNode;
 }
-
-// Tolerate both layouts: when run via `bun run server.ts`, argv[0..1] are bun + script;
-// when run as a `bun build --compile` exe, argv[0] is the exe itself. `slice(1)` strips
-// the leading process binary in both cases, leaving just user flags.

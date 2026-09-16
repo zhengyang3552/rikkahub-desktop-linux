@@ -4,6 +4,9 @@ import i18n from "~/i18n";
 
 import { ArrowLeft, Bot, CheckCircle2, CopyPlus, Database, FileClock, Globe, Heart, KeyRound, Loader2, Mic, Search, Settings2, UserRound, Brain } from "lucide-react";
 import { Link } from "react-router";
+
+import { WindowControlsBar, windowDragRegionProps } from "~/components/window-controls";
+import { SidebarBrandRow } from "~/components/sidebar-brand";
 import { MemorySection } from "~/components/memory/memory-section";
 import { toast } from "sonner";
 
@@ -111,8 +114,9 @@ export default function SettingsPage() {
       .catch((error: Error) => toast.error(error.message));
   }, [section]);
 
+  // 日志问题 3:二次确认收口到 LogsSection.clearVisible(一次确认管请求+错误两类);
+  // 本回调退化为纯删除动作,绝不能再各自弹确认(双弹窗)或先删后问。
   const clearLogs = React.useCallback(async () => {
-    if (!(await confirmDialog({ title: t("settings:logs.clear_confirm"), danger: true }))) return;
     try {
       await api.delete("logs");
       setLogs([]);
@@ -132,9 +136,12 @@ export default function SettingsPage() {
 
   if (!settings) {
     return (
-      <div className="flex h-svh items-center justify-center text-muted-foreground">
-        <Loader2 className="mr-2 size-4 animate-spin" />
-        {t("settings:providers.loading")}
+      <div className="flex h-svh flex-col overflow-hidden bg-background">
+        <WindowControlsBar className="mt-1.5 mr-2" />
+        <div className="flex min-h-0 flex-1 items-center justify-center text-muted-foreground">
+          <Loader2 className="mr-2 size-4 animate-spin" />
+          {t("settings:providers.loading")}
+        </div>
       </div>
     );
   }
@@ -146,23 +153,28 @@ export default function SettingsPage() {
 
   return (
     <div className="flex h-svh overflow-hidden bg-background">
+      {/* 问题7(2.0.0 内测):镶边结构与主界面对齐——侧栏通顶(品牌行兼窗口拖拽区),
+          窗控条只嵌在右侧内容列顶部,不再横贯全宽把侧栏压下一条。 */}
       <aside
         className={cn(
           "w-full flex-col border-r border-divider bg-sidebar text-sidebar-foreground md:w-64",
           mobileContentOpen ? "hidden md:flex" : "flex",
         )}
       >
-        {/* pt-9 让出沉浸式标题栏高度,标题栏透明后内容仍顶到窗口顶但不会被盖住。
-            border-divider:用比 --border 更淡的分界色,让区域分隔退到背景里。 */}
-        <div className="flex items-center gap-2 border-b border-divider px-4 pb-3 pt-9">
-          <Button asChild size="icon-sm" variant="ghost">
-            <Link to="/">
-              <ArrowLeft className="size-4" />
-            </Link>
-          </Button>
-          <div>
-            <div className="text-sm font-semibold">RikkaHub PC</div>
-            <div className="text-xs text-muted-foreground">{t("settings:nav.subtitle")}</div>
+        {/* border-divider:用比 --border 更淡的分界色,让区域分隔退到背景里。
+            问题7回访:品牌行(Logo+RikkaHub,SidebarBrandRow 三页同源)延续主界面设计,
+            pt-1 使品牌行距顶 4px——与主界面(SidebarHeader p-2 + -mt-1)同一几何;
+            下方动作行放返回键+分区标题(text-sm font-semibold,与旧版大标题同级,
+            勿降为小字)。两行都是拖拽区(放行选择器已覆盖 asChild Link 的 <a>)。 */}
+        <div className="border-b border-divider px-4 pb-3 pt-1">
+          <SidebarBrandRow />
+          <div className="mt-2 flex items-center gap-2" {...windowDragRegionProps()}>
+            <Button asChild size="icon-sm" variant="ghost">
+              <Link to="/" aria-label={t("settings:nav.back")}>
+                <ArrowLeft className="size-4" />
+              </Link>
+            </Button>
+            <div className="text-sm font-semibold">{t("settings:nav.subtitle")}</div>
           </div>
         </div>
         <nav className="space-y-1 p-2">
@@ -200,10 +212,13 @@ export default function SettingsPage() {
           })}
         </nav>
       </aside>
-      <main className={cn("min-w-0 flex-1", mobileContentOpen ? "block" : "hidden md:block")}>
-        <ScrollArea className="h-svh">
-          <div className="mx-auto w-full max-w-5xl px-6 pb-6 pt-9">
-            {/* pt-9 与左侧 aside 顶部对齐,让出沉浸式透明标题栏高度,避免各板块内容贴顶。 */}
+      <div className={cn("min-w-0 flex-1 flex-col", mobileContentOpen ? "flex" : "hidden md:flex")}>
+        {/* I1:无边框窗口拖拽区 + 窗控钮(仅内容列;侧栏顶部由品牌行承担)。
+            mt-1.5/mr-2 对齐主界面 SidebarInset 的 pt-1.5/pr-2:窗控钮三页同一坐标。 */}
+        <WindowControlsBar className="mt-1.5 mr-2" />
+        <main className="min-h-0 flex-1">
+        <ScrollArea className="h-full">
+          <div className="mx-auto w-full max-w-5xl px-6 py-6">
             {/* 窄屏内容页头:返回导航列表 + 当前分区名(md 起隐藏) */}
             <div className="mb-4 flex items-center gap-2 md:hidden">
               <Button
@@ -248,7 +263,8 @@ export default function SettingsPage() {
             {section === "about" && <AboutSection />}
           </div>
         </ScrollArea>
-      </main>
+        </main>
+      </div>
     </div>
   );
 }

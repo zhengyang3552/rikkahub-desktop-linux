@@ -31,6 +31,13 @@ node_modules/
 # Logs
 *.log
 
+# AI Memory / agent 本地指导文档(仅本机使用,不随仓库分发)
+# .claude/ 含 settings.local.json 这类 per-machine 权限白名单;CLAUDE.md / AGENTS.md
+# 无路径前缀,各层级(根 / web-ui)同名文件一并忽略。无构建依赖,删跟踪不影响编译。
+.claude/
+CLAUDE.md
+AGENTS.md
+
 # Reference source trees (separate repos, checked out locally for study)
 Rikkahub-Android/
 cherry-studio/
@@ -47,3 +54,12 @@ pi/
 代理工作方案.md
 pc-server/pc-data/
 pc-server/tsconfig.unused.json
+
+# 内嵌 bash 运行时的二进制产物与 staging(~8.5MB/24MB,由 scripts/build-bash-bundle.ts
+# 从本机 Git for Windows 抽取生成,源码进 git、产物不入库,与 dist/ 同纪律)。
+# bash-bundle.version.json(版本戳)是例外——进 git,runtime 据此判定落地覆盖。
+/pc-server/assets/bash/
+/pc-server/assets/bash-bundle.tar.gz
+
+# 参考项目（本地逆向研究用，613MB asar 等大文件，永不入库）
+/Reference-project/

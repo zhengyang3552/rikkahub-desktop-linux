@@ -1,4 +1,11 @@
 {
+  "commands": {
+    "menu_label": "斜杠指令",
+    "compact": {
+      "description": "压缩当前会话上下文",
+      "argument_hint": "[额外指示]"
+    }
+  },
   "mcp": {
     "title": "MCP",
     "description": "选择当前助手可用的 MCP 服务器",
@@ -53,7 +60,11 @@
         "description": "模型将使用大量推理来回答问题。"
       },
       "xhigh": {
-        "label": "极限",
+        "label": "超高",
+        "description": "模型将使用超高推理预算来回答问题。"
+      },
+      "max": {
+        "label": "最大",
         "description": "模型将使用最大推理预算来回答问题。"
       }
     }
@@ -112,8 +123,10 @@
     "uploading_progress": "上传中 {{percent}}%",
     "parsing_progress": "解析中 {{done}}/{{total}} 页",
     "parsing": "解析中",
+    "parsing_send_blocked": "附件解析中，完成后即可发送",
     "extraction_failed": "解析失败：发送时将无法附带此文件的正文",
-    "extraction_empty": "未能提取出文本（可能是扫描件或不支持的格式）"
+    "extraction_empty": "未能提取出文本（可能是扫描件或不支持的格式）",
+    "stop_generating": "停止生成"
   },
   "resize_handle": "拖动调整输入框大小",
   "compress_history": "压缩对话历史",
@@ -134,5 +147,20 @@
     "mic_denied": "无法访问麦克风",
     "start": "语音识别",
     "stop": "停止语音识别"
+  },
+  "workspace_permission": {
+    "title": "工作区权限",
+    "confirm_each": "询问批准",
+    "confirm_each_hint": "总是询问是否允许工具操作",
+    "balanced": "默认权限",
+    "balanced_hint": "仅对潜在不安全操作询问",
+    "full_access": "完全访问",
+    "full_access_hint": "不受限制操作电脑文件",
+    "save_failed": "保存权限档位失败"
+  },
+  "integrations": {
+    "title": "MCP 与拓展",
+    "description": "为当前助手选择 MCP 工具与拓展能力",
+    "tab_mcp": "MCP"
   }
 }

@@ -62,6 +62,13 @@ function requestJson(req: Request) {
   return req.json().catch(() => ({})) as Promise<AnyRecord>;
 }
 
+/** 会话事件流中的 engine-status 帧序列(压缩/重试状态条的服务端广播,事件名带连字符)。 */
+function eventsToEngineStatusFrames(events: AnyRecord[]): AnyRecord[] {
+  return events
+    .filter((event) => event.event === "engine-status")
+    .map((event) => (event.data ?? {}) as AnyRecord);
+}
+
 function promptTextFromChatBody(body: AnyRecord) {
   return (body.messages ?? [])
     .map((item: AnyRecord) => typeof item.content === "string" ? item.content : JSON.stringify(item.content ?? ""))
@@ -100,6 +107,11 @@ const mockServer = Bun.serve({
             ]);
           }
           if (promptText.includes("conversation compression assistant") || promptText.includes("<conversation>")) {
+            // 压缩请求走辅助模型;带"保留工具调用结论"指示的请求挂起 2s,给进行中互斥
+            // 冒烟(双发起 409)制造确定性窗口——普通压缩请求保持快返回。
+            if (promptText.includes("保留工具调用结论")) {
+              await Bun.sleep(2000);
+            }
             return sse([
               { choices: [{ delta: { content: "Compressed " } }] },
               { payload: { choices: [{ delta: { content: "conversation summary." } }] }, delayMs: 80 },
@@ -569,6 +581,9 @@ function spawnPcServer() {
       PORT: String(pcPort),
       RIKKAHUB_PC_DATA_DIR: tempDir,
       BROWSER: "none",
+      // 假新用户专题:冒烟 spawn 的 server 不得上报(否则一次冒烟记一个假新用户)。
+      // 即便宿主机环境误设了 RIKKAHUB_ANALYTICS=1,这里也要显式压成 0。
+      RIKKAHUB_ANALYTICS: "0",
       // I-2(专题2):压小快照窗口,runWindowedSnapshotSmoke 用 4 轮(8 节点)会话
       // 触发窗口化路径;其余用例会话 ≤6 节点,行为与默认窗口(60)完全一致。
       RIKKA_SNAPSHOT_NODE_WINDOW: "6",
@@ -693,19 +708,25 @@ async function collectConversationEvents(id: string, stop: (events: AnyRecord[])
   const decoder = new TextDecoder();
   let buffer = "";
   const started = Date.now();
+  // 待决 read 跨迭代持有:Promise.race 只是"这一轮不等它",绝不能丢掉它。
+  // 曾经每轮新建 reader.read() 去 race,空闲超时那一轮的 read 被弃置——但它已经在
+  // 排队消费流,后续到达的那个 chunk 落进被弃 promise 里永久丢失(ReadableStream 的
+  // 并发 read 按序各自兑现)。丢的 chunk 恰是关键帧/尾帧时,断言看到的就是"缺中间态
+  // 关键帧""缺 text_delta""stop 条件永不满足致 20s 超时"三种随机表现——本 smoke 的
+  // 长期偶发红全部出自此处,与被测代码无关。
+  let pending: ReturnType<typeof reader.read> | null = null;
   try {
     for (;;) {
       if (Date.now() - started > timeoutMs) throw new Error(`conversation stream timeout: ${JSON.stringify(events.slice(-5), null, 2)}`);
-      const read = await Promise.race([
-        reader.read(),
-        new Promise<ReadableStreamReadResult<Uint8Array>>((_, reject) =>
-          setTimeout(() => reject(new Error("conversation stream idle timeout")), 1000),
-        ),
-      ]).catch((err: unknown): null => {
-        if (Date.now() - started > timeoutMs) throw err;
-        return null;
-      });
-      if (!read) continue;
+      const current = (pending ??= reader.read());
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      const raced = await Promise.race([
+        current.then((value) => ({ idle: false as const, value })),
+        new Promise<{ idle: true }>((resolve) => { idleTimer = setTimeout(() => resolve({ idle: true }), 1000); }),
+      ]).finally(() => clearTimeout(idleTimer));
+      if (raced.idle) continue; // 本轮空闲:pending 保留,下一轮继续等同一个 read
+      pending = null;
+      const read = raced.value;
       if (read.done) break;
       buffer += decoder.decode(read.value, { stream: true });
       const blocks = buffer.split(/\n\n+/);
@@ -938,6 +959,13 @@ async function runConversation(useResponseApi: boolean) {
   assert(streamEvents.some((item) => item.event === "node_update"), "conversation SSE did not emit node_update events");
   assert(streamEvents.some((item) => item.event === "snapshot" && item.data?.conversation?.isGenerating === false), "conversation SSE did not emit final non-generating snapshot");
   assert(assistantMessage.parts.some((part: AnyRecord) => part.type === "tool" && part.toolName === "get_time_info" && Array.isArray(part.output) && part.output.length > 0), "tool result was not persisted in assistant parts");
+  // 一次调用一张卡:Responses 的 function_call 带两个 id(item.id=fc_… / call_id=call_…),
+  // 参数帧只带 item_id。误把 item_id 当调用 id 会落库两张卡(空参的 call_ 卡 + 有参的 fc_ 卡),
+  // 空参卡进下一问历史即 400 input.arguments(2026-09-07 内测报障)。上面那条"有输出的卡存在"
+  // 断言对幽灵卡免疫,故必须单独锁卡数与参数非空。
+  const timeToolParts = assistantMessage.parts.filter((part: AnyRecord) => part.type === "tool" && part.toolName === "get_time_info");
+  assert(timeToolParts.length === 1, `expected exactly 1 get_time_info tool card, got ${timeToolParts.length} (ghost card from tool-call id mix-up?)`);
+  assert(String(timeToolParts[0]?.input ?? "").trim().length > 0, "tool card input must not be empty (empty arguments 400s on strict endpoints)");
   assert(textFromParts(assistantMessage.parts).includes("继续回复"), "assistant final text missing");
   const captured = requests.slice(beforeCount);
   const streamCaptured = captured.filter((item) => item.body?.stream === true);
@@ -950,6 +978,15 @@ async function runConversation(useResponseApi: boolean) {
     assert(Array.isArray(follow?.input), "Response API follow-up input missing");
     assert(follow.input.some((item: AnyRecord) => item.type === "function_call"), "Response API follow-up missing function_call history item");
     assert(follow.input.some((item: AnyRecord) => item.type === "function_call_output"), "Response API follow-up missing function_call_output item");
+    // 回传的 call_id 必须是模型给的 call_…(工具调用配对 id),不能是 fc_…(输出条目 id);
+    // arguments 必须非空。两者皆为火山等严格端点 400 的直接触发物。
+    for (const item of follow.input.filter((entry: AnyRecord) => entry.type === "function_call")) {
+      assert(String(item.call_id ?? "") === "call_time_response_1", `function_call call_id must be the model call id, got ${String(item.call_id)}`);
+      assert(String(item.arguments ?? "").trim().length > 0, "function_call arguments must not be empty");
+    }
+    for (const item of follow.input.filter((entry: AnyRecord) => entry.type === "function_call_output")) {
+      assert(String(item.call_id ?? "") === "call_time_response_1", `function_call_output call_id must pair with the call, got ${String(item.call_id)}`);
+    }
   } else {
     const first = streamCaptured.find((item) => item.path === "/v1/chat/completions")?.body;
     const follow = streamCaptured.filter((item) => item.path === "/v1/chat/completions").at(-1)?.body;
@@ -1766,17 +1803,33 @@ async function runCompressionSmoke() {
     (item) => !item.isGenerating && assistantMessages(item).some((msg: AnyRecord) => textFromParts(msg.parts ?? []).includes("继续回复")),
     "answer before compression",
   );
-  await expectApiError(
-    `/api/conversations/${conversationId}/compress`,
-    { method: "POST", body: JSON.stringify({ keepRecentMessages: 32, targetTokens: 512 }) },
-    "消息数量不足",
-  );
+  // ① 完成态幂等:无 compaction_boundary 的新会话先来一次降级压缩(keep 32 > 消息数
+  //   自动折半)——回归锁:降级逻辑活着;若未来恢复"不足即拒绝",这里红。
+  //   此压缩挂在 mock 的 2s 延迟窗上(带"保留工具调用结论"指示),顺势充当 ② 的
+  //   在飞压缩:进行时撞第二次,服务端权威 compressing 注册表必须 409。
+  const inFlightCompression = fetch(`${baseUrl}/api/conversations/${conversationId}/compress`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ keepRecentMessages: 32, targetTokens: 512, additionalPrompt: "保留工具调用结论" }),
+  }).then(async (response) => {
+    assert(response.ok, `first compression should succeed via keep-recent degradation, got ${response.status}: ${await response.text()}`);
+  });
+  // 等第一次压缩确实进入服务端注册表再撞第二次(mock 的 2s 延迟给了充足窗口)。
+  await Bun.sleep(150);
+  const conflictResponse = await fetch(`${baseUrl}/api/conversations/${conversationId}/compress`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ keepRecentMessages: 0, targetTokens: 512, additionalPrompt: "保留工具调用结论" }),
+  });
+  assert(conflictResponse.status === 409, `concurrent compression should 409, got ${conflictResponse.status}: ${await conflictResponse.text()}`);
+  await inFlightCompression;
+  // engine-status 帧是瞬态广播(不进快照),只在压缩生命周期内订阅才能收到;
+  // 收集器必须挂在带延迟窗的最终压缩上(keep 0 → 压全部 → 走 mock 的 2s 延迟)。
+  // 注意:busy:false 兜底清条只在 pi 引擎生成路径广播(编排器 isRunAndSuspend),
+  // 对话模式手动压缩只发"压缩相"帧——终止条件锁定压缩相帧本身。
   const compressionEventsPromise = collectConversationEvents(
     conversationId,
-    (events) => events.some((event) =>
-      event.event === "snapshot" &&
-      selectedMessages(event.data?.conversation ?? {}).some((msg: AnyRecord) => textFromParts(msg.parts ?? []).includes("Compressed conversation summary."))
-    ),
+    (events) => eventsToEngineStatusFrames(events).some((frame) => frame.phase === "compacting"),
     15_000,
   );
   await Bun.sleep(50);
@@ -1786,11 +1839,14 @@ async function runCompressionSmoke() {
   });
   assert(result.status === "compressed", "compression route should return compressed status");
   const compressionEvents = await compressionEventsPromise;
-  assert(compressionEvents.some((event) =>
-    event.event === "snapshot" &&
-    Array.isArray(event.data?.conversation?.chatSuggestions) &&
-    event.data.conversation.chatSuggestions.some((item: string) => item.includes("正在压缩对话历史"))
-  ), "compression did not broadcast progress suggestion");
+  // 压缩进度经 engine-status 帧呈现(状态条"正在压缩上下文 (n/m)"),原实现借
+  // chatSuggestions 建议条的 hack 已随 R7-4 退役——断言改为:压缩期间广播过
+  // engine-status 压缩相,且结束后广播 busy:false 清条。
+  const engineStatusFrames = eventsToEngineStatusFrames(compressionEvents);
+  assert(
+    engineStatusFrames.some((frame) => frame.phase === "compacting" && frame.busy === true),
+    "compression did not broadcast engine-status compacting phase",
+  );
   const compressed = await api(`/api/conversations/${conversationId}`);
   assert(selectedMessages(compressed).some((msg: AnyRecord) => textFromParts(msg.parts ?? []).includes("Compressed conversation summary.")), "compressed summary was not written back as context");
   const compressionRequest = requests
@@ -1972,6 +2028,8 @@ async function runImageGenerationSmoke() {
     { method: "POST", body: JSON.stringify({ prompt: "blocked edit", referenceFileIds: [referenceId] }) },
     "Gemini image edit is not supported",
   );
+  // state.json 落盘走 scheduleThrottledSaveState(200ms 节流)——直接读文件可能早于落盘。
+  await Bun.sleep(600);
   const stateAfter = JSON.parse(readFileSync(join(tempDir, "state.json"), "utf8"));
   assert(stateAfter.generatedImages.some((item: AnyRecord) => item.type === "image_generation" && item.prompt === "smoke generated image"), "generated image was not persisted");
   assert(stateAfter.generatedImages.some((item: AnyRecord) => item.type === "image_edit" && item.sourceFileIds?.[0] === referenceId), "edited image reference was not persisted");
@@ -2133,8 +2191,13 @@ async function runPlainTextStreamingSmoke() {
     .flatMap((item) => (item.data?.deltas ?? []) as AnyRecord[])
     .map((delta) => String(delta.text ?? ""))
     .join("");
+  // 锁"增量协议活着",不锁"哪一段一定走增量":生成收尾的 broadcastNodeUpdate 是关键帧,
+  // 若最后一段的 33ms 合帧窗口尚未到就收尾,该段会被关键帧吸收(客户端拿到全量,行为正确)。
+  // 断言写成"末段必是 text_delta"曾让本子测偶发红——那是测试对时序的错误假设,不是回归。
+  // H-b 真正的回归形态是"一个 text_delta 都没有"(退化回每帧全量);末态含第三段由上面的
+  // stop 条件(snapshot isGenerating=false 且含第三段)保证。
   assert(
-    deltaText.includes("第三段"),
+    deltaText.length > 0,
     `plain-text streaming emitted no text_delta frames (H-b regression): ${JSON.stringify(deltaText)}`,
   );
   return nodeTexts.length + streamEvents.filter((item) => item.event === "text_delta").length;

@@ -10,6 +10,7 @@ import { JsonTree, tryParseJson } from "~/components/ui/json-tree";
 import { cn } from "~/lib/utils";
 import { SectionHeader } from "~/components/settings/shared";
 import { appErrorText, useAppErrorsStore } from "~/stores";
+import { confirmDialog } from "~/stores/confirm-store";
 import type { AppErrorDto } from "~/types";
 
 // FE-P1-2 收编:线上契约单源在后端 foundation/types(此前本地手抄漏了 providerId)。
@@ -34,10 +35,14 @@ export function LogsSection({ logs, onClear }: { logs: RequestLog[]; onClear: ()
     items.sort((a, b) => b.at - a.at);
     return items;
   }, [logs, errors, filter]);
-  const clearVisible = React.useCallback(() => {
+  // 日志问题 3:确认必须先于任何删除。此前请求日志的 confirm 藏在 onClear 内部,而
+  // clearErrors 在弹窗弹出前就已执行——用户点"取消"错误日志也没了,二次确认形同虚设。
+  // 收口:本层统一确认一次,通过后才按当前筛选分发两类清空;onClear 退化为纯删除动作。
+  const clearVisible = React.useCallback(async () => {
+    if (!(await confirmDialog({ title: t("settings:logs.clear_confirm"), danger: true }))) return;
     if (filter !== "errors") onClear();
     if (filter !== "requests") void clearErrors();
-  }, [filter, onClear, clearErrors]);
+  }, [filter, onClear, clearErrors, t]);
   const filterOptions: Array<{ id: LogFilter; label: string }> = [
     { id: "all", label: t("settings:logs.filter_all") },
     { id: "requests", label: t("settings:logs.filter_requests") },
@@ -68,7 +73,7 @@ export function LogsSection({ logs, onClear }: { logs: RequestLog[]; onClear: ()
         {feed.length > 0 ? (
           <button
             type="button"
-            onClick={clearVisible}
+            onClick={() => void clearVisible()}
             className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs text-destructive transition hover:bg-destructive/10"
           >
             <Trash2 className="size-3.5" />
@@ -105,7 +110,7 @@ function RequestLogRow({ log, onClick }: { log: RequestLog; onClick: () => void 
     >
       <div className="flex items-center justify-between gap-2">
         <span className="font-semibold text-primary">{log.method ?? "POST"}</span>
-        <span className={cn("text-xs font-medium", log.ok ? "text-emerald-600" : "text-destructive")}>
+        <span className={cn("text-xs font-medium", log.ok ? "text-success" : "text-destructive")}>
           {log.status}
         </span>
       </div>
@@ -125,7 +130,7 @@ function RequestLogRow({ log, onClick }: { log: RequestLog; onClick: () => void 
 
 const SEVERITY_STYLE: Record<AppErrorDto["severity"], string> = {
   error: "bg-destructive/10 text-destructive",
-  warn: "bg-amber-500/10 text-amber-600",
+  warn: "bg-warning/10 text-warning",
   info: "bg-muted text-muted-foreground",
 };
 
@@ -215,7 +220,7 @@ function LogDetailDialog({ log, onClose }: { log: RequestLog | null; onClose: ()
             <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:grid-cols-3">
               <DetailField label={t("settings:logs.field_time")} value={new Date(log.at).toLocaleString()} />
               <DetailField label={t("settings:logs.field_method")} value={log.method ?? "-"} />
-              <DetailField label={t("settings:logs.field_status")} value={String(log.status)} valueClass={log.ok ? "text-emerald-600" : "text-destructive"} />
+              <DetailField label={t("settings:logs.field_status")} value={String(log.status)} valueClass={log.ok ? "text-success" : "text-destructive"} />
               <DetailField label={t("settings:logs.field_duration")} value={`${log.durationMs ?? 0}ms`} />
               <DetailField label={t("settings:logs.field_provider")} value={log.providerName} />
               <DetailField label={t("settings:logs.field_kind")} value={log.kind ?? "-"} />

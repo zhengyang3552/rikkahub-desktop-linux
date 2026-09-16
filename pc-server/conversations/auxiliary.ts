@@ -4,16 +4,18 @@
 import type { Assistant, AuxiliaryTextOptions, Conversation, Message, MessagePart, Model } from "../foundation/types";
 import { applyPlaceholders, id, isRecord, localeDisplayName, message, textFromParts, uniqueStrings } from "../foundation/utils";
 import { state } from "../persistence/json-store";
-import { broadcastConversation } from "../api/sse";
+import { broadcastConversation, broadcastEngineStatus } from "../api/sse";
 import { DEFAULT_AUTO_MODEL_ID, applyCustomBody, applyRequestHeaders, findModel } from "../model-providers";
 import { endpointFor } from "../model-providers/checks";
+import { openAiMaxTokensField, reasoningLevelNormalized } from "../model-providers/request-dialect";
+import { internalOutputCap, requiredOutputCap } from "../model-providers/model-limits";
 import {
   auxiliaryReasoningPayloadForProvider,
   claudeThinkingPayload,
   dataUrlForMessageUrl,
+  hostOfProvider,
   isModelAllowTemperature,
   parseDataUrl,
-  reasoningLevelNormalized,
   supportsAbility,
   supportsInputModality,
 } from "../inference-engine/message-builder";
@@ -23,17 +25,21 @@ import {
   fetchGoogleAuxiliaryStream,
   fetchOpenAiAuxiliaryStream,
   fetchText,
+  modelsDevCache,
 } from "../inference-engine/providers";
 import {
   DEFAULT_COMPRESS_PROMPT,
   DEFAULT_OCR_PROMPT,
   DEFAULT_SUGGESTION_PROMPT,
   DEFAULT_TITLE_PROMPT,
+  OCR_OUTPUT_TOKENS,
   SUGGESTION_CHARACTER_LIMIT,
   TITLE_CHARACTER_LIMIT,
 } from "../app-config/prompts";
+import { compressing } from "./generation-state";
 import { getConversation, persistConversation, selectedConversationMessages } from "./index";
 import { findAssistant, summaryAsText } from "./helpers";
+import { agentSummaryAsText, buildAgentCompactionContext, extractAgentActivity } from "../workspace/compaction";
 
 export function cleanAuxiliaryText(text: string, fallback = "") {
   const cleaned = text.replace(/^["“”'‘’]+|["“”'‘’]+$/g, "").trim();
@@ -115,6 +121,8 @@ export async function fetchAuxiliaryText(modelId: string, prompt: string, kind: 
   const maxTokens = options.maxTokens ?? null;
   const reasoningLevel = options.reasoningLevel ?? null;
   const stream = options.stream === true;
+  // 取消信号:仅压缩链路(带 signal 调用)生效,其余调用方 undefined —— 与既有不传 signal 行为逐字节一致。
+  const signal = options.signal;
   const pushDelta = (text: string) => {
     if (text) options.onDelta?.(text);
   };
@@ -150,19 +158,28 @@ export async function fetchAuxiliaryText(modelId: string, prompt: string, kind: 
     if (stream) {
       const streamEndpoint = `${providerItem.baseUrl.replace(/\/+$/, "")}/models/${selectedModel}:streamGenerateContent`;
       try {
-        return cleanAuxiliaryText(await fetchGoogleAuxiliaryStream(streamEndpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, pushDelta));
+        return cleanAuxiliaryText(await fetchGoogleAuxiliaryStream(streamEndpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, pushDelta, signal));
       } catch {
         // Fall back to non-streaming auxiliary calls; some compatible gateways do not expose Gemini streaming.
       }
     }
-    return fetchText(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, (raw) => raw.candidates?.[0]?.content?.parts?.[0]?.text);
+    return fetchText(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, (raw) => raw.candidates?.[0]?.content?.parts?.[0]?.text, signal);
   }
   if (providerItem.type === "claude") {
     headers["x-api-key"] = providerItem.apiKey;
     headers["anthropic-version"] = "2023-06-01";
     body = {
       model: selectedModel,
-      max_tokens: maxTokens ?? 64_000,
+      // Anthropic 协议 max_tokens 必填。两种来源分开处理:调用方给了 maxTokens 的
+      // (提示词优化 4096)那是**我们的**任务预算,须收进模型真实上限(internalOutputCap);
+      // 没给的(标题/建议/翻译/压缩)走与主生成路径同一个 requiredOutputCap 单源。
+      // 此前是 `maxTokens ?? DEFAULT_OUTPUT_TOKENS` —— 后者恒 64000,对输出上限低于
+      // 此值的模型(claude-3-haiku 4096、cohere command-r 4000)Anthropic 直接 400,
+      // 与本次 1210 报障同类,只是触发面在辅助任务、更难被注意到。
+      max_tokens:
+        maxTokens != null
+          ? internalOutputCap(modelsDevCache, providerItem, modelItem.modelId, maxTokens)
+          : requiredOutputCap(modelsDevCache, providerItem, modelItem.modelId, null),
       messages: [{ role: "user", content: prompt }],
       stream,
       ...(options.temperature != null && (!reasoningLevel || !reasoningEnabled(reasoningLevel)) ? { temperature: options.temperature } : {}),
@@ -171,12 +188,12 @@ export async function fetchAuxiliaryText(modelId: string, prompt: string, kind: 
     };
     if (stream) {
       try {
-        return cleanAuxiliaryText(await fetchClaudeAuxiliaryStream(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, pushDelta));
+        return cleanAuxiliaryText(await fetchClaudeAuxiliaryStream(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, pushDelta, signal));
       } catch {
         body.stream = false;
       }
     }
-    return fetchText(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, (raw) => raw.content?.map((item: { text?: string }) => item.text ?? "").join("\n"));
+    return fetchText(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, (raw) => raw.content?.map((item: { text?: string }) => item.text ?? "").join("\n"), signal);
   }
   headers.Authorization = `Bearer ${providerItem.apiKey}`;
   body = providerItem.useResponseApi
@@ -194,21 +211,22 @@ export async function fetchAuxiliaryText(modelId: string, prompt: string, kind: 
         model: selectedModel,
         messages: [{ role: "user", content: prompt }],
         stream,
-        ...(maxTokens != null ? { max_tokens: maxTokens } : {}),
+        // 上限字段名走统一请求方言（model-providers/request-dialect），与主生成路径一致。
+        ...(maxTokens != null ? { [openAiMaxTokensField(hostOfProvider(providerItem))]: maxTokens } : {}),
         ...(options.temperature != null && isModelAllowTemperature(modelItem) ? { temperature: options.temperature } : {}),
         ...(options.topP != null && isModelAllowTemperature(modelItem) ? { top_p: options.topP } : {}),
         ...auxiliaryReasoningPayloadForProvider(providerItem, modelItem, reasoningLevel),
       };
   if (stream) {
     try {
-      const text = await fetchOpenAiAuxiliaryStream(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, pushDelta);
+      const text = await fetchOpenAiAuxiliaryStream(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, pushDelta, signal);
       if (!text || text === "(empty response)") throw new Error(`${kind} model returned empty response`);
       return text;
     } catch {
       body.stream = false;
     }
   }
-  const text = await fetchText(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, completionMessageText);
+  const text = await fetchText(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, completionMessageText, signal);
   if (!text || text === "(empty response)") throw new Error(`${kind} model returned empty response`);
   return text;
 }
@@ -231,20 +249,23 @@ async function fetchAuxiliaryOcrText(imageUrl: string) {
   const providerItem = picked.provider;
   const modelItem = picked.model;
   const selectedModel = modelItem.modelId === "auto" ? "gpt-4o-mini" : modelItem.modelId;
+  const prompt = state.settings.ocrPrompt || DEFAULT_OCR_PROMPT;
+  const dataUrl = dataUrlForMessageUrl(imageUrl);
+  // OCR 的 2048 是我们给这个任务定的预算,不是用户的选择:收进模型真实上限,免得对
+  // 输出上限更低的模型硬发大数(见 internalOutputCap 头注)。三个协议 + assistant 共用。
+  const ocrCap = internalOutputCap(modelsDevCache, providerItem, modelItem.modelId, OCR_OUTPUT_TOKENS);
   const assistant = {
     ...findAssistant(state.settings.assistantId),
     chatModelId: modelItem.id,
     systemPrompt: "",
     temperature: 0,
     topP: null,
-    maxTokens: 2048,
+    maxTokens: ocrCap,
     streamOutput: false,
     enabledSkills: [],
     mcpServers: [],
     localTools: [],
   } as Assistant;
-  const prompt = state.settings.ocrPrompt || DEFAULT_OCR_PROMPT;
-  const dataUrl = dataUrlForMessageUrl(imageUrl);
   const headers = applyRequestHeaders({ "Content-Type": "application/json" }, assistant, providerItem, modelItem);
   let endpoint = endpointFor(providerItem);
   let body: Record<string, any>;
@@ -273,7 +294,7 @@ async function fetchAuxiliaryOcrText(imageUrl: string) {
     headers["anthropic-version"] = "2023-06-01";
     body = {
       model: selectedModel,
-      max_tokens: 2048,
+      max_tokens: ocrCap,
       messages: [{
         role: "user",
         content: [
@@ -296,7 +317,7 @@ async function fetchAuxiliaryOcrText(imageUrl: string) {
             { type: "input_image", image_url: dataUrl },
           ],
         }],
-        max_output_tokens: 2048,
+        max_output_tokens: ocrCap,
       }
     : {
         model: selectedModel,
@@ -307,7 +328,8 @@ async function fetchAuxiliaryOcrText(imageUrl: string) {
             { type: "image_url", image_url: { url: dataUrl } },
           ],
         }],
-        max_tokens: 2048,
+        // 上限字段名走统一请求方言（o 系官方口同样具备视觉能力，恒发 max_tokens 会 400）。
+        [openAiMaxTokensField(hostOfProvider(providerItem))]: ocrCap,
         temperature: isModelAllowTemperature(modelItem) ? 0 : undefined,
       };
   return cleanAuxiliaryText(await fetchText(endpoint, headers, applyCustomBody(body, assistant, modelItem), providerItem, completionMessageText));
@@ -377,17 +399,42 @@ export async function generateSuggestionsForConversation(conversation: Conversat
   ).slice(0, 10);
 }
 
+/** 压缩发生点标记(两模式共享):压缩完成时打在"当时的最新一条消息"上,前端据此在该
+ *  消息下方渲染"上下文已压缩"分割线——锚定用户发起压缩的位置。刻意不锚定切点/摘要
+ *  的技术形态(pi 保留窗口的切点在时间线中段,线画在那里用户会疑惑"我在底部发的
+ *  /compact,线怎么跑上面去了")。幂等:同一条消息不重复打。 */
+export function markCompactionBoundary(conversation: Conversation): void {
+  const tail = selectedConversationMessages(conversation).at(-1);
+  if (!tail) return;
+  tail.annotations ??= [];
+  if (tail.annotations.some((item) => isRecord(item) && item.type === "compaction_boundary")) return;
+  tail.annotations.push({ type: "compaction_boundary" });
+}
+
 export async function compressConversation(conversation: Conversation, additionalPrompt = "", targetTokens = 2000, keepRecentMessages = 32, signal?: AbortSignal) {
   const allMessages = selectedConversationMessages(conversation);
   if (allMessages.length === 0) throw new Error("当前会话没有可压缩的消息");
+  // 审计防线快照:压缩是"按开头快照整体覆盖 messages"的破坏性替换,期间任何写入
+  // (发消息/重新生成/删除节点等)都会在覆盖时被静默吞掉。API 三写入口已 409 互斥,
+  // 这里再记引用+长度,落库前比对——防住未来新增的绕过入口的写路径(fail-safe:
+  // 宁可压缩作废重来,不可丢用户数据)。
+  const messagesRefBefore = conversation.messages;
+  const messagesLengthBefore = conversation.messages.length;
+
+  // 内测反馈(310K 会话 /compact 报"消息数量不足"):按条数保留的语义对"少而长"的会话
+  // 不成立——20 条超长消息的会话 token 巨大,却因条数 ≤ 默认保留 32 条被整体划进保留区,
+  // 直接拒绝。压缩的目的是省上下文,"保留最近 N 条"是手段不是目的:条数不足时自动降级
+  // 为保留一半(至少压掉一半旧消息),恒可压。单条消息 floor(1/2)=0 → 全压成摘要,同样成立。
+  let effectiveKeepRecent = keepRecentMessages;
+  if (effectiveKeepRecent > 0 && allMessages.length <= effectiveKeepRecent) {
+    effectiveKeepRecent = Math.floor(allMessages.length / 2);
+  }
 
   let messagesToCompress: Message[];
   let messagesToKeep: Message[];
-  if (keepRecentMessages > 0 && allMessages.length > keepRecentMessages) {
-    messagesToCompress = allMessages.slice(0, -keepRecentMessages);
-    messagesToKeep = allMessages.slice(-keepRecentMessages);
-  } else if (keepRecentMessages > 0) {
-    throw new Error("消息数量不足，无法在保留最近消息的同时压缩历史");
+  if (effectiveKeepRecent > 0) {
+    messagesToCompress = allMessages.slice(0, -effectiveKeepRecent);
+    messagesToKeep = allMessages.slice(-effectiveKeepRecent);
   } else {
     messagesToCompress = allMessages;
     messagesToKeep = [];
@@ -399,47 +446,59 @@ export async function compressConversation(conversation: Conversation, additiona
     return [...splitMessages(messages.slice(0, mid)), ...splitMessages(messages.slice(mid))];
   };
 
+  // Agent 分化(§9.8):入口/管线/提示词同一套,仅输入构建按会话类型变——工具 part 折为
+  // 摘要行进压缩输入,工作区活动清单经 {additional_context} 结构化注入(pi CompactionDetails
+  // 思想)。chat 会话(workspaceId 空)走原路径,逐字节不变。
+  const isAgent = Boolean(conversation.workspaceId);
+  const summarize = isAgent ? (msg: Message) => agentSummaryAsText(msg, summaryAsText(msg)) : summaryAsText;
   const chunks = splitMessages(messagesToCompress);
   const summaries: string[] = [];
-  try {
-    for (const chunk of chunks) {
-      // R7-4:每个分块前查取消——用户中途取消不再烧后续分块的 LLM 轮次。
-      if (signal?.aborted) throw new DOMException("Compression cancelled", "AbortError");
-      // 2-3:进度标签只随 chunk 变化,chunk 级更新+广播一次;原先在 onDelta 里每个 token
-      // 都 persistConversation+saveState+broadcastConversation(长会话流式压缩=每秒几十次
-      // 全表重写)。标签是瞬态进度不落库,压缩结果在循环后统一 persist。
-      conversation.chatSuggestions = [`正在压缩对话历史... ${summaries.length + 1}/${chunks.length}`];
-      conversation.updateAt = Date.now();
-      broadcastConversation(conversation);
-      const prompt = applyPlaceholders(state.settings.compressPrompt || DEFAULT_COMPRESS_PROMPT, {
-        content: chunk.map(summaryAsText).join("\n\n"),
-        target_tokens: String(targetTokens),
-        additional_context: additionalPrompt.trim() ? `Additional instructions from user: ${additionalPrompt.trim()}` : "",
-        locale: localeDisplayName(),
-      });
-      summaries.push(cleanAuxiliaryText(await fetchAuxiliaryText(state.settings.compressModelId || state.settings.chatModelId, prompt, "compression", {
-        stream: true,
-      })));
-    }
-    // R7-4:落库前最后一道闸——取消后 LLM 结果作废,绝不改写会话(压缩是破坏性替换,
-    // 取消语义必须硬保证)。
+  // 失败/取消的 UI 收尾无需在此处理:进度在 engine-status 帧里(compress 端点 finally
+  // 统一广播 busy:false),不再有落在会话对象上的瞬态标签需要清理。
+  for (const chunk of chunks) {
+    // R7-4:每个分块前查取消——用户中途取消不再烧后续分块的 LLM 轮次。
     if (signal?.aborted) throw new DOMException("Compression cancelled", "AbortError");
-    // 批6复审 G1:会话在压缩期间被删除/被导入替换时结果同样作废——下方 persistConversation
-    // 是无条件 upsert,会把已删会话复活成"只剩摘要"的僵尸。
-    if (getConversation(conversation.id) !== conversation) throw new Error("会话已被删除,压缩结果作废");
-  } catch (err) {
-    // 失败/取消统一清掉瞬态进度标签并广播,不给 UI 留"正在压缩..."僵尸提示
-    // (顺带修复原有缺陷:LLM 失败时标签同样残留)。
-    conversation.chatSuggestions = [];
-    conversation.updateAt = Date.now();
-    broadcastConversation(conversation);
-    throw err;
+    // 分块进度走 engine-status 帧(状态条统一渲染"正在压缩上下文 (n/m) · 已处理 xx秒")。
+    // 原实现借 chatSuggestions 建议条展示进度文本——挪用了建议区的语义位,且文案
+    // 无法 i18n;进度本就是引擎状态的一部分,并入 engine-status 后该 hack 退役。
+    // startedAt 从 compressing 注册表回读(compress 端点开始时写入),进度帧不重置计时。
+    broadcastEngineStatus(conversation.id, {
+      busy: true,
+      phase: "compacting",
+      progress: { current: summaries.length + 1, total: chunks.length },
+      ...(compressing.has(conversation.id) ? { startedAt: compressing.get(conversation.id) } : {}),
+    });
+    const contextSections = [
+      additionalPrompt.trim() ? `Additional instructions from user: ${additionalPrompt.trim()}` : "",
+      isAgent ? buildAgentCompactionContext(extractAgentActivity(chunk)) : "",
+    ].filter(Boolean);
+    const prompt = applyPlaceholders(state.settings.compressPrompt || DEFAULT_COMPRESS_PROMPT, {
+      content: chunk.map(summarize).join("\n\n"),
+      target_tokens: String(targetTokens),
+      additional_context: contextSections.join("\n\n"),
+      locale: localeDisplayName(),
+    });
+    summaries.push(cleanAuxiliaryText(await fetchAuxiliaryText(state.settings.compressModelId || state.settings.chatModelId, prompt, "compression", {
+      stream: true,
+      signal,
+    })));
+  }
+  // R7-4:落库前最后一道闸——取消后 LLM 结果作废,绝不改写会话(压缩是破坏性替换,
+  // 取消语义必须硬保证)。
+  if (signal?.aborted) throw new DOMException("Compression cancelled", "AbortError");
+  // 批6复审 G1:会话在压缩期间被删除/被导入替换时结果同样作废——下方 persistConversation
+  // 是无条件 upsert,会把已删会话复活成"只剩摘要"的僵尸。
+  if (getConversation(conversation.id) !== conversation) throw new Error("会话已被删除,压缩结果作废");
+  // 审计防线:期间有写入(push 改长度 / delete-filter 换引用)则整体作废,绝不覆盖。
+  if (conversation.messages !== messagesRefBefore || conversation.messages.length !== messagesLengthBefore) {
+    throw new Error("会话在压缩期间发生变更,压缩结果作废,请重试");
   }
 
   conversation.messages = [
     ...summaries.filter(Boolean).map((summary) => ({ id: id(), messages: [message("USER", [{ type: "text", text: summary }])], selectIndex: 0 })),
     ...messagesToKeep.map((msg) => ({ id: id(), messages: [JSON.parse(JSON.stringify(msg))], selectIndex: 0 })),
   ];
+  markCompactionBoundary(conversation);
   conversation.chatSuggestions = [];
   conversation.updateAt = Date.now();
   persistConversation(conversation);

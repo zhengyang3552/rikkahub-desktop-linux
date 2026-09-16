@@ -23,9 +23,11 @@ import { Switch } from "~/components/ui/switch";
 import { useAutosaveDraft } from "~/hooks/use-autosave-draft";
 import { cn } from "~/lib/utils";
 import api, { appendWebAuthQuery } from "~/services/api";
+import { isTauriEnvironment } from "~/lib/system-info";
 import { confirmDialog } from "~/stores/confirm-store";
 import type { S3Config, Settings, WebDavConfig } from "~/types";
 import { SectionHeader } from "~/components/settings/shared";
+import { AutosaveStatusRow } from "~/components/settings/autosave-status";
 
 interface S3BackupItem {
   href: string;
@@ -475,8 +477,57 @@ export function DataSection({
     }
   };
 
+  // 问题5(2.0.0 内测):桌面端(Tauri)导出用系统保存对话框自选位置。次序是"先选位置、后生成"
+  // ——用户取消对话框时请求根本不会发出,天然满足"没选位置就关掉 → 不留任何文件"。
+  // 生成期间服务端(与壳同机)把 zip 直写目标路径,多 GB 备份零 HTTP 传输、零下载目录中转,
+  // 故无字节进度可展示(构建期本就无进度,与 GET 流程的"准备导出"阶段一致)。
+  const doExportToPickedPath = async () => {
+    let target: string | null = null;
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      // 建议名与服务端 GET 流程同构(时间戳仅为对话框预填,最终名以用户输入为准)。
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").replace(/T/, "_").replace(/Z$/, "").replace(/-/g, "").slice(0, 15);
+      target = await save({
+        defaultPath: `rikkahub-backup-${stamp}.zip`,
+        filters: [{ name: "Zip", extensions: ["zip"] }],
+      });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : t("settings:data.export_failed"));
+      return;
+    }
+    if (!target) return; // 用户取消:零生成零残留
+    setExporting(true);
+    const prepToast = toast.loading(t("settings:data.export_preparing"));
+    try {
+      const res = await fetch(appendWebAuthQuery("/api/data/export/to-path"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targetPath: target }),
+      });
+      const data = (await res.json().catch(() => null)) as
+        | { ok?: boolean; fileName?: string; warnings?: string[]; error?: string }
+        | null;
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || t("settings:data.export_http_error", { status: res.status }));
+      }
+      toast.dismiss(prepToast);
+      // 成功文案展示用户选择的完整路径(比 GET 流程的"文件名+去下载目录找"更明确)。
+      toast.success(t("settings:data.export_done", { name: target }), { duration: 8000 });
+      for (const warning of data.warnings ?? []) toast.warning(warning, { duration: 12000 });
+    } catch (err) {
+      toast.dismiss(prepToast);
+      toast.error(err instanceof Error ? err.message : t("settings:data.export_failed"));
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const doExport = async () => {
     setShowExportDialog(false);
+    if (isTauriEnvironment()) {
+      await doExportToPickedPath();
+      return;
+    }
     setExporting(true);
     setExportProgress(0);
     setExportedBytes(0);
@@ -487,7 +538,7 @@ export function DataSection({
       // progress bar — Bun's response carries a Content-Length so the browser knows the
       // total up front. ky/fetch don't expose download progress without a custom
       // ReadableStream consumer; XHR is simpler and well-supported by Tauri's webview.
-      const result: { blob: Blob; fileName: string } = await new Promise((resolve, reject) => {
+      const result: { blob: Blob; fileName: string; warnings: string[] } = await new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open("GET", appendWebAuthQuery("/api/data/export"));
         xhr.responseType = "blob";
@@ -509,8 +560,19 @@ export function DataSection({
             // X-Export-Filename is set by the server with the canonical zip filename, so we
             // don't have to recompute the timestamp on the client (and risk it drifting).
             const headerName = xhr.getResponseHeader("X-Export-Filename") || "";
+            // B4-①:关键降级项(安卓库失败/附件缺失)随 header 透出,逐条解析成可读文案。
+            let warnings: string[] = [];
+            const warningsHeader = xhr.getResponseHeader("X-Export-Warnings");
+            if (warningsHeader) {
+              try {
+                const parsed = JSON.parse(warningsHeader);
+                if (Array.isArray(parsed)) warnings = parsed.map((w) => String(w));
+              } catch {
+                warnings = [];
+              }
+            }
             const fallback = `rikkahub-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.zip`;
-            resolve({ blob: xhr.response as Blob, fileName: headerName || fallback });
+            resolve({ blob: xhr.response as Blob, fileName: headerName || fallback, warnings });
           } else {
             reject(new Error(t("settings:data.export_http_error", { status: xhr.status })));
           }
@@ -534,6 +596,10 @@ export function DataSection({
       // Long-lived success toast so the user has time to read the filename before it dismisses.
       // 8s is enough to copy the name into a file manager search box if they want.
       toast.success(t("settings:data.export_done", { name: result.fileName }), { duration: 8000 });
+      // B4-①:备份"成功但缺件"(安卓库失败/附件缺失)必须显式警告,不能只在成功 toast 里带过。
+      for (const warning of result.warnings) {
+        toast.warning(warning, { duration: 12000 });
+      }
     } catch (error) {
       toast.dismiss(prepToast);
       toast.error(error instanceof Error ? error.message : t("settings:data.export_failed"));
@@ -825,7 +891,7 @@ export function DataSection({
                 />
               </div>
               {exportTotalBytes === 0 ? (
-                <div className="text-[0.6875rem] text-muted-foreground">
+                <div className="text-mini text-muted-foreground">
                   {t("settings:data.pack_slow")}
                 </div>
               ) : null}
@@ -851,7 +917,7 @@ export function DataSection({
                 />
               </div>
               {importPhase === "processing" ? (
-                <div className="text-[0.6875rem] text-muted-foreground">
+                <div className="text-mini text-muted-foreground">
                   {t("settings:data.extract_slow")}
                 </div>
               ) : null}
@@ -880,7 +946,7 @@ export function DataSection({
               <div className="flex items-center gap-2 text-sm font-medium">
                 {t("settings:data.webdav_title")}
                 {ANDROID_COMPAT_CARD_ENABLED && schemaStatus && !schemaStatus.hasAndroidSchema && (
-                  <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[0.625rem] text-amber-700 dark:bg-amber-900 dark:text-amber-300">
+                  <span className="rounded bg-amber-100 px-1.5 py-0.5 text-micro text-amber-700 dark:bg-amber-900 dark:text-amber-300">
                     {t("settings:data.chat_unsyncable")}
                   </span>
                 )}
@@ -889,9 +955,11 @@ export function DataSection({
                 {t("settings:data.webdav_desc")}
               </div>
             </div>
-            <div className="text-xs text-muted-foreground">
-              {webDavBusy ? t("settings:data.processing") : t("settings:common.autosaved")}
-            </div>
+            <AutosaveStatusRow
+              status={webDavAutosave.status}
+              onRetry={() => void webDavAutosave.saveNow()}
+              className="px-0"
+            />
           </div>
           <div className="mt-4 grid gap-3 md:grid-cols-2">
             <label className="space-y-1">
@@ -1083,7 +1151,7 @@ export function DataSection({
               <div className="flex items-center gap-2 text-sm font-medium">
                 {t("settings:data.s3_title")}
                 {ANDROID_COMPAT_CARD_ENABLED && schemaStatus && !schemaStatus.hasAndroidSchema && (
-                  <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[0.625rem] text-amber-700 dark:bg-amber-900 dark:text-amber-300">
+                  <span className="rounded bg-amber-100 px-1.5 py-0.5 text-micro text-amber-700 dark:bg-amber-900 dark:text-amber-300">
                     {t("settings:data.chat_unsyncable")}
                   </span>
                 )}
@@ -1091,6 +1159,11 @@ export function DataSection({
               <div className="mt-1 text-xs text-muted-foreground">{t("settings:data.s3_desc")}</div>
             </div>
             <div className="flex items-center gap-2">
+              <AutosaveStatusRow
+                status={s3Autosave.status}
+                onRetry={() => void s3Autosave.saveNow()}
+                className="px-0"
+              />
               <span className="text-xs text-muted-foreground">Path-style</span>
               <Switch
                 checked={s3Draft.pathStyle}

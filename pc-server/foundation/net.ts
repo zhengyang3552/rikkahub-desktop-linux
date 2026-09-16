@@ -272,7 +272,8 @@ export function ipInCidr(ip: string, cidr: string): boolean {
 }
 
 // Bun fetch 在进程首次网络请求时快照 HTTPS_PROXY/HTTP_PROXY/NO_PROXY env 并永久锁定
-// （实测 Bun 1.3.13）。本函数在 server 启动早期（首次 fetch 前）安装拦截：
+// （实测 Bun 1.3.13；1.4.0 经 scripts/proxy-behavior-smoke.ts 复核锁仍在、direct/manual 分流
+// 与错误分类正则均未漂移）。本函数在 server 启动早期（首次 fetch 前）安装拦截：
 //   - 非容器部署：清空 env 防 Bun 锁定旧代理
 //   - 容器部署（mode=env）：保留 docker 注入的 HTTPS_PROXY，让 Bun 快照它
 //   - 替换 globalThis.fetch，per-request 按当前代理状态显式传 proxy 选项
@@ -292,6 +293,45 @@ export function installProxyFetchInterceptor(getProxyConfig: () => ProxyConfig):
     if (explicitProxy !== undefined) {
       return originalFetch(input, init);
     }
+
+    // ── 统一禁用 Bun 300s socket 空闲定时器(所有引擎的 LLM fetch 自动继承)─────────
+    // Bun fetch 每个 socket 默认带 BUN_CONFIG_HTTP_IDLE_TIMEOUT=300s 空闲定时器,触发即
+    // TimeoutError。思考型模型闷头想 >300s 且零字节(等响应头、无 keepalive)会被它抢先
+    // 杀掉,我们应用层看门狗(600s headerTimeoutMs / 120s STREAM_IDLE / AbortSignal.timeout)
+    // 来不及救——经 scripts/fetch-idle-timeout-smoke.ts 本地决定性实验实锤(裸 fetch 在
+    // 300032ms 被杀、timeout:0 撑过 305s)。
+    //
+    // 为什么敢在拦截器一刀切而非逐引擎加:我们应用层对每条 fetch 都有自己的计时(signal /
+    // AbortSignal.timeout / fetchWithTimeout),Bun 的空闲定时器对我们永远多余,禁掉它只是
+    // 把计时权完全收归我们的看门狗(单一计时源)。这正是「新引擎零负担」的收口——第三/第四
+    // 引擎的 LLM fetch 只要走 globalThis.fetch(都过本拦截器),就自动免疫,无需各自记得加。
+    //
+    // 两条护栏(有意为之的调用方不动):
+    //   1. 调用方显式传了 init.timeout(有限数或 false)= 自己定了空闲策略,尊重不覆盖。
+    //   2. input 是 Request 对象(常见于 Bun.serve 入站请求被转发):其 signal 是 Bun.serve
+    //      内部的,叠加 timeout:0 可能相互影响,跳过不注入。
+    const explicitTimeout = (init as (RequestInit & { timeout?: number | boolean }) | undefined)?.timeout;
+    const shouldDisableIdle = !(input instanceof Request) && explicitTimeout === undefined;
+    let effectiveInit = shouldDisableIdle
+      ? ({ ...(init as RequestInit), timeout: 0 } as RequestInit & { timeout: number })
+      : init;
+
+    // ── SSE 请求统一禁用压缩(accept-encoding: identity)──────────────────────────
+    // 内测反馈(Kimi 流式"停住数秒→哗啦一大段"):Bun fetch 默认协商 gzip/br,上游或
+    // 中间层若对 SSE 响应启用块压缩,解压端必须攒满一个压缩块才能吐出明文——逐事件
+    // flush 的流被切成一段段批量到达。SSE 语义上就不该压缩,对声明 Accept:
+    // text/event-stream 的请求显式要求 identity,禁止压缩协商。
+    // 收口哲学同上方 timeout:0:凡走 globalThis.fetch 的流式请求(pi 引擎在内)自动
+    // 免疫,新引擎零负担。护栏:调用方已显式传 accept-encoding 则尊重;Request 对象
+    // 输入跳过(理由同护栏 2)。
+    if (!(input instanceof Request) && effectiveInit?.headers) {
+      const headers = new Headers(effectiveInit.headers as HeadersInit);
+      if ((headers.get("accept") ?? "").includes("text/event-stream") && !headers.has("accept-encoding")) {
+        headers.set("accept-encoding", "identity");
+        effectiveInit = { ...(effectiveInit as RequestInit), headers } as typeof effectiveInit;
+      }
+    }
+
     let target = "";
     if (typeof input === "string") target = input;
     else if (input instanceof URL) target = input.href;
@@ -308,9 +348,9 @@ export function installProxyFetchInterceptor(getProxyConfig: () => ProxyConfig):
       }
     }
     if (proxy) {
-      return originalFetch(input, { ...(init as RequestInit), proxy } as RequestInit & { proxy: string });
+      return originalFetch(input, { ...(effectiveInit as RequestInit), proxy } as RequestInit & { proxy: string });
     }
-    return originalFetch(input, init);
+    return originalFetch(input, effectiveInit);
   } as typeof fetch;
 }
 
@@ -420,6 +460,8 @@ export function fetchWithTimeout(url: string | URL, init: FetchWithTimeoutInit =
   const { timeoutMs = DEFAULT_OUTBOUND_TIMEOUT_MS, signal, ...rest } = init;
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const combined = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+  // 无需传 Bun timeout 键:net.ts 的 fetch 拦截器已对所有走 globalThis.fetch 的调用统一注入
+  // timeout:0(禁用 Bun 300s socket 空闲定时器),本包装的 combined 看门狗是唯一计时源。
   return fetch(url, { ...rest, signal: combined });
 }
 

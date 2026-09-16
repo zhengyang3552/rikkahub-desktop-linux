@@ -16,8 +16,17 @@ export const dataDir = resolve(process.env.RIKKAHUB_PC_DATA_DIR ?? join(rootDir,
 
 export const filesDir = join(dataDir, "files");
 export const skillsDir = join(dataDir, "skills");
+// 工作区宿主目录(agent 模式)。managed 型工作区在 workspaces/<id>/{files/, tmp/} 下托管:
+// files/ 是模型可见的边界根,tmp/ 放超长 shell 输出落盘等 PC 侧杂物;folder 型工作区
+// root 指向用户真实目录,但 tmp/ 仍在这里(不污染用户目录)。
+export const workspacesDir = join(dataDir, "workspaces");
 // 用户上传的自定义字体。跟 files/skills 同级，落在 pc-data/ 下，gitignored 且应用更新不覆盖。
 export const customFontsDir = join(dataDir, "fonts");
+// pi 引擎的 agentDir（方案"客房"：近乎空置、可整目录清空、用户无感）。auth.json/models.json
+// 永不写入——模型与密钥经 ModelRuntime 内存注册注入，唯一事实源是 state.json。
+// P7 起其子目录 sessions/(jsonl 引擎记忆)已退役:启动卫生(data-dir-hygiene)会整目录
+// 清掉残留,会话上下文每轮从会话行确定性重建(pi-engine/context-encoder)。
+export const piAgentDir = join(dataDir, "pi-agent");
 export const statePath = join(dataDir, "state.json");
 // 会话活库（SQLite，WAL）。1.2.6：会话从 state.json 迁出，改用 SQLite 增量写——流式只
 // upsert 当前在长的那个节点行，不再每 200ms 全量重写 state.json。与备份库（导出时现场
@@ -37,5 +46,22 @@ export const assistantMemoryPath = join(memoryDir, "assistant_memory.json");
 export const pendingMemoryPath = join(memoryDir, "pending_memory.json");
 
 export const deviceIdPath = join(dataDir, "device-id.txt");
+
+// 启动/崩溃取证黑匣子(issue 后端无声退出)。boot-trace.ts 用"启动标记→干净退出删除→
+// 崩溃残留"机制:正常用下来 logs/ 里什么都不留,只有"上次没干净退出"才残留一份遗言。
+//   pending:本次启动的里程碑标记,Bun.serve 监听成功即删;留到下次启动 = 上次崩了。
+//   server.log:capturePreviousBootTrace 把残留 pending 转存成这份供查看(含崩溃区间判读)。
+export const logsDir = join(dataDir, "logs");
+export const bootPendingPath = join(logsDir, "server.boot.pending.log");
+export const bootLogPath = join(logsDir, "server.log");
+
+// 内嵌 bash 运行时的落地目录(仅 Windows)。固定路径(非系统 tmp)——杀软对固定路径的
+// 已签名/已知文件更友好,且随应用生命周期(卸载 dataDir 即一并清)。仅版本戳变更时整目录
+// 重落地,不频繁删写。落地保持 MSYS2 的 usr/bin/ 平铺(exe 与 msys-*.dll 同目录,见
+// scripts/build-bash-bundle.ts 头注)。
+export const runtimeBinDir = join(dataDir, "runtime-bin");
+export const embeddedBashDir = join(runtimeBinDir, "bash");
+export const embeddedBashExe = join(embeddedBashDir, "usr", "bin", "bash.exe");
+export const embeddedBashStampPath = join(embeddedBashDir, ".rikkahub-stamp.json");
 
 export const MODELS_DEV_CACHE_PATH = join(dataDir, "models-dev-cache.json");

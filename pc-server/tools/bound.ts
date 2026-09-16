@@ -26,3 +26,17 @@ export function openAiLocalTools(assistant: Assistant) {
 export function openAiMcpTools(assistant: Assistant) {
   return openAiMcpToolsCore(assistant, state.settings.mcpServers);
 }
+
+/** 会话级函数工具全集（M1-4）：四家装配点（orchestrator ×4 + conversation-encoding）
+ *  的唯一聚合入口，消灭复读展开式。
+ *  P6 退役:工作区工具条件挂载已移除——生成路由与旧挂载判定同用
+ *  workspaceRuntimeForConversation,工作区可用必走 pi 会话(工具由
+ *  pi-engine/workspace-tools 承载),不可用时旧挂载本就返回空,两头皆死代码。 */
+export function conversationFunctionTools(assistant: Assistant) {
+  return [
+    ...openAiSearchTools(),
+    ...openAiLocalTools(assistant),
+    ...openAiSkillTools(assistant),
+    ...openAiMcpTools(assistant),
+  ];
+}

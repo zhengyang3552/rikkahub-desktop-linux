@@ -13,12 +13,14 @@ import { cn } from "~/lib/utils";
 import { getAudioPlaybackKey, stopAudio, useAudioPlaybackKey } from "~/lib/global-audio";
 import { ttsController, useIsTtsActiveForKey } from "~/lib/tts/tts-controller";
 import { Button } from "~/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "~/components/ui/tooltip";
 import api from "~/services/api";
 import { useCurrentModel } from "~/hooks/use-current-model";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "~/components/ui/dropdown-menu";
 import { ChatMessageAnnotationsRow } from "./chat-message-annotations";
 import { ChatMessageAvatarRow } from "./chat-message-avatar-row";
 import { MessageParts } from "./message-part";
+import { ModelCallErrorCard } from "./model-call-error-card";
 import Markdown from "~/components/markdown/markdown";
 import { toast } from "sonner";
 import { confirmDialog } from "~/stores/confirm-store";
@@ -186,61 +188,52 @@ function formatNumber(value: number): string {
 // 原实现每条消息各自 useState + useEffect,切模型时 N 条消息 = N 个 effect 重跑 + 2N 次
 // setState(undefined→v)抖动。改为单一 module 状态 + 订阅:切模型只在第一个消费者触发时
 // 算一次,结果广播给所有 NerdLineRow,避免 N 条消息各自抖动。
+// 传的是模型的**本地 UUID**(不是上游 modelId):后端按 findModel 解析出生效 provider,
+// 再按其 baseUrl 主机查目录 —— 同一个上游模型名在不同服务商下窗口不同,必须能区分,
+// 且 providerOverwrite(按模型改服务商)也只有走 findModel 才展开得到。
 const contextLimitCache = new Map<string, Promise<number | null>>();
 type ContextLimitState = {
-  modelId: string;
-  providerType: string;
+  modelKey: string;
   limit: number | null | undefined;
 };
-let sharedContextLimit: ContextLimitState = { modelId: "", providerType: "", limit: undefined };
+let sharedContextLimit: ContextLimitState = { modelKey: "", limit: undefined };
 const contextLimitListeners = new Set<() => void>();
 function notifyContextLimit() {
   for (const listener of contextLimitListeners) listener();
 }
-function ensureContextLimit(modelId: string, providerType: string) {
-  if (
-    sharedContextLimit.modelId === modelId &&
-    sharedContextLimit.providerType === providerType
-  ) {
+function ensureContextLimit(modelKey: string) {
+  if (sharedContextLimit.modelKey === modelKey) {
     return;
   }
   // 切到新模型:分母先回退到 undefined(getNerdStats 回退到 usage.contextLimit 快照),避免
   // 短暂显示上一个模型的 live 值。然后异步取新模型的 limit。
-  sharedContextLimit = { modelId, providerType, limit: undefined };
+  sharedContextLimit = { modelKey, limit: undefined };
   notifyContextLimit();
-  if (!modelId || !providerType) return;
-  const cacheKey = `${providerType}/${modelId}`;
+  if (!modelKey) return;
   // 首次查才发请求,后续(含同 tick 其他消息)复用同一 Promise。后端 context-limit 路由
   // 会 await models.dev 加载完,所以 null 的语义是确定的"models.dev 里查不到"——可安全缓存。
-  let p = contextLimitCache.get(cacheKey);
+  let p = contextLimitCache.get(modelKey);
   if (!p) {
     p = api
-      .get<{ contextLimit: number | null }>(
-        `context-limit?modelId=${encodeURIComponent(modelId)}&providerType=${encodeURIComponent(providerType)}`,
-      )
+      .get<{ contextLimit: number | null }>(`context-limit?modelId=${encodeURIComponent(modelKey)}`)
       .then((res) => res.contextLimit ?? null)
       .catch(() => null);
-    contextLimitCache.set(cacheKey, p);
+    contextLimitCache.set(modelKey, p);
   }
   void p.then((v) => {
     // 结果到达时仍要确认没再切模型,否则会覆盖更新的查询。
-    if (
-      sharedContextLimit.modelId === modelId &&
-      sharedContextLimit.providerType === providerType
-    ) {
+    if (sharedContextLimit.modelKey === modelKey) {
       sharedContextLimit = { ...sharedContextLimit, limit: v };
       notifyContextLimit();
     }
   });
 }
 function useCurrentContextLimit(): number | null | undefined {
-  const { currentModel, currentProvider } = useCurrentModel();
-  const modelId = currentModel?.modelId ?? "";
-  // currentProvider.type 经 ProviderProfile 的索引签名返回 unknown,显式窄化为 string。
-  const providerType = typeof currentProvider?.type === "string" ? currentProvider.type : "";
+  const { currentModelId } = useCurrentModel();
+  const modelKey = currentModelId ?? "";
   React.useEffect(() => {
-    ensureContextLimit(modelId, providerType);
-  }, [modelId, providerType]);
+    ensureContextLimit(modelKey);
+  }, [modelKey]);
   return React.useSyncExternalStore(
     (onStoreChange) => {
       contextLimitListeners.add(onStoreChange);
@@ -269,9 +262,10 @@ interface NerdStatItem {
 }
 
 // Context window 占用单独返回(渲染时推到行尾右对齐),与 token / 速度 / 时长那组左对齐分开。
+// H6:改为结构化数据,由 ContextGauge 渲染成进度环 + 悬停详情卡(NewMax 对位)。
 interface NerdStats {
   items: NerdStatItem[];
-  context: NerdStatItem | null;
+  context: { usedTokens: number; limitTokens: number | null } | null;
 }
 
 function getNerdStats(
@@ -308,7 +302,11 @@ function getNerdStats(
   const durationMs = getDurationMs(createdAt, finishedAt);
   if (durationMs && usage.completionTokens > 0) {
     const durationSeconds = durationMs / 1000;
-    const tps = usage.completionTokens / durationSeconds;
+    // 速度分母 = 纯生成耗时(服务端骨架累计,不含轮间工具执行/审批等待)。工具调用
+    // 回合用全程墙钟会把速度稀释到失真(内测反馈)。旧数据/工作区 pi 路径无该字段,
+    // 回退全程。时长指标仍显示全程(用户等待感知),两者语义不同属有意设计。
+    const speedMs = usage.generationMs && usage.generationMs > 0 ? usage.generationMs : durationMs;
+    const tps = usage.completionTokens / (speedMs / 1000);
 
     items.push({
       key: "speed",
@@ -334,27 +332,70 @@ function getNerdStats(
   // 分子。分母优先用当前选中模型的 contextLimit(切模型即更新),loading / 查不到时回退到该消息
   // 生成时的快照(usage.contextLimit),避免切换瞬间分母闪烁/消失。
   const contextTokens = usage.promptTokens + usage.completionTokens;
-  let context: NerdStatItem | null = null;
+  let context: NerdStats["context"] = null;
   if (contextTokens > 0) {
-    const used =
-      contextTokens >= 1000 ? `${(contextTokens / 1000).toFixed(1)}k` : String(contextTokens);
     const liveValue = liveContextLimit != null && liveContextLimit > 0 ? liveContextLimit : null;
     const snapValue = usage.contextLimit && usage.contextLimit > 0 ? usage.contextLimit : null;
-    const limitValue = liveValue ?? snapValue;
-    const limit =
-      limitValue != null
-        ? limitValue >= 1000
-          ? `${(limitValue / 1000).toFixed(1)}k`
-          : String(limitValue)
-        : null;
-    context = {
-      key: "context",
-      icon: <Gauge className="size-3" />,
-      label: limit ? `${used} / ${limit}` : used,
-    };
+    context = { usedTokens: contextTokens, limitTokens: liveValue ?? snapValue };
   }
 
   return { items, context };
+}
+
+/** token 数简写:36k / 1M(NewMax 悬停卡口径,整数位去掉 .0)。 */
+function formatTokenCount(value: number): string {
+  const trim = (s: string) => s.replace(/\.0$/, "");
+  if (value >= 1_000_000) return `${trim((value / 1_000_000).toFixed(1))}M`;
+  if (value >= 1000) return `${trim((value / 1000).toFixed(1))}k`;
+  return String(value);
+}
+
+/** 上下文占用进度环(H6,NewMax 对位):环体填充 used/limit,悬停出详情卡;
+    模型上限未知时无法算百分比,退回 Gauge 图标 + 数字文本。 */
+function ContextGauge({ usedTokens, limitTokens }: { usedTokens: number; limitTokens: number | null }) {
+  const { t } = useTranslation("message");
+  if (limitTokens == null) {
+    return (
+      <div className="inline-flex items-center gap-1">
+        <Gauge className="size-3" />
+        <span>{formatTokenCount(usedTokens)}</span>
+      </div>
+    );
+  }
+  const percent = Math.min(100, (usedTokens / limitTokens) * 100);
+  const usedPct = Math.min(100, Math.max(percent > 0 ? 1 : 0, Math.round(percent)));
+  const radius = 5;
+  const circumference = 2 * Math.PI * radius;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="inline-flex cursor-default items-center">
+          <svg className="size-3.5 shrink-0 -rotate-90" viewBox="0 0 14 14">
+            <circle cx="7" cy="7" r={radius} fill="none" stroke="currentColor" strokeOpacity="0.25" strokeWidth="2" />
+            <circle
+              cx="7"
+              cy="7"
+              r={radius}
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeDasharray={`${(circumference * percent) / 100} ${circumference}`}
+              strokeLinecap="round"
+            />
+          </svg>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="top" align="end" className="text-center">
+        <div>{t("chat_message.context_window_title")}</div>
+        <div className="mt-0.5">
+          {t("chat_message.context_window_usage", { used: usedPct, left: 100 - usedPct })}
+        </div>
+        <div className="mt-0.5 font-normal text-[var(--ds-text-secondary)]">
+          {formatTokenCount(usedTokens)} / {formatTokenCount(limitTokens)} tokens
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  );
 }
 
 function parseToolOutputJson(text: string): unknown {
@@ -715,7 +756,7 @@ const ChatMessageActionsRow = React.memo(
           type="button"
           variant="ghost"
         >
-          {copied ? <Check className="size-3.5 text-emerald-500" /> : <Copy className="size-3.5" />}
+          {copied ? <Check className="size-3.5 text-success" /> : <Copy className="size-3.5" />}
         </Button>
 
         {canEdit && (
@@ -799,7 +840,7 @@ const ChatMessageActionsRow = React.memo(
             >
               <ChevronLeft className="size-3.5" />
             </Button>
-            <span className="text-[0.6875rem] text-muted-foreground">
+            <span className="text-mini text-muted-foreground">
               {node.selectIndex + 1}/{node.messages.length}
             </span>
             <Button
@@ -826,7 +867,6 @@ const ChatMessageActionsRow = React.memo(
               disabled={actionDisabled}
               className={actionButtonClass}
               size="icon-xs"
-              title={t("chat_message.more_actions")}
               type="button"
               variant="ghost"
             >
@@ -904,7 +944,7 @@ const ChatMessageNerdLineRow = React.memo(
       return (
         <div
           className={cn(
-            "flex w-full flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[0.6875rem] text-muted-foreground/50",
+            "flex w-full flex-wrap items-center gap-x-3 gap-y-1 px-1 text-mini text-muted-foreground/50",
             alignRight ? "justify-end" : "justify-start",
           )}
         >
@@ -914,11 +954,11 @@ const ChatMessageNerdLineRow = React.memo(
     }
 
     return (
-      <div className="flex w-full flex-wrap items-center justify-between gap-x-3 gap-y-1 px-1 text-[0.6875rem] text-muted-foreground/50">
+      <div className="flex w-full flex-wrap items-center justify-between gap-x-3 gap-y-1 px-1 text-mini text-muted-foreground/50">
         <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
           {items.map(renderStat)}
         </div>
-        {renderStat(context)}
+        <ContextGauge usedTokens={context.usedTokens} limitTokens={context.limitTokens} />
       </div>
     );
   },
@@ -944,7 +984,6 @@ export const ChatMessage = React.memo(
     selected = false,
     onToggleSelect,
   }: ChatMessageProps) => {
-    const { t } = useTranslation("message");
     const isUser = message.role === "USER";
     const providers = useSettingsStore((state) => state.settings?.providers);
     const displaySetting = useSettingsStore((state) => state.settings?.displaySetting);
@@ -1037,6 +1076,9 @@ export const ChatMessage = React.memo(
             >
               <MessageParts
                 parts={message.parts}
+                messageId={message.id}
+                messageCreatedAt={message.createdAt}
+                messageFinishedAt={message.finishedAt}
                 loading={loading}
                 assistant={assistant}
                 role={message.role as "USER" | "ASSISTANT" | "SYSTEM" | "TOOL"}
@@ -1070,13 +1112,7 @@ export const ChatMessage = React.memo(
         )}
 
         {hasModelCallError ? (
-          <a
-            className="mx-1 inline-flex items-center gap-1 rounded-md border bg-card px-2 py-1 text-xs text-primary shadow-sm transition hover:bg-accent"
-            href={modelSettingsHref}
-          >
-            <Zap className="size-3.5" />
-            {t("chat_message.open_model_settings")}
-          </a>
+          <ModelCallErrorCard annotations={message.annotations} settingsHref={modelSettingsHref} />
         ) : null}
 
         <ChatMessageAnnotationsRow annotations={message.annotations} alignRight={isUser} />

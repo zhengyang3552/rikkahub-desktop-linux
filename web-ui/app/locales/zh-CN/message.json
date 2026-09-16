@@ -1,10 +1,12 @@
 {
   "message_parts": {
     "tool_step_hint": "[工具步骤应在思维链中渲染]",
-    "collapse_thinking": "收起思考过程",
-    "expand_thinking_steps": "展开 {{count}} 条思考步骤",
+    "collapse_work_steps": "收起工作过程",
+    "expand_work_steps": "展开 {{count}} 条工作步骤",
     "deep_thinking": "深度思考",
-    "thinking_seconds": "思考了 {{seconds}} 秒"
+    "thinking_seconds": "思考了 {{seconds}} 秒",
+    "elapsed_running_seconds": "已运行 {{seconds}} 秒",
+    "elapsed_done_seconds": "用时 {{seconds}} 秒"
   },
   "chat_message": {
     "copy_image": "图片",
@@ -56,14 +58,20 @@
     "md_document_label": "文档",
     "md_video_label": "视频",
     "md_audio_label": "音频",
-    "export_success_md": "已导出 Markdown",
-    "export_success_image": "已导出图片",
-    "export_success_desc": "文件已下载到浏览器下载目录:{{filename}}",
+    "export_success": "已导出",
+    "export_success_desc": "文件已保存:{{filename}}",
+    "export_show_in_folder": "在文件夹中显示",
     "export_image_watermark": "由 Rikkahub Desktop 生成 · rikkahub-desktop.pages.dev",
     "open_model_settings": "打开模型设置",
+    "generation_failed": "生成失败",
+    "copy_error": "复制错误信息",
+    "expand_error": "展开错误详情",
+    "collapse_error": "收起错误详情",
     "translation": "译文",
     "expand_translation": "展开译文",
-    "collapse_translation": "收起译文"
+    "collapse_translation": "收起译文",
+    "context_window_title": "上下文窗口：",
+    "context_window_usage": "已用 {{used}}%（剩余 {{left}}%）"
   },
   "memory": {
     "pending_title": "待确认的记忆",
@@ -119,12 +127,51 @@
     "pending_approval_title": "AI 正在请求工具调用授权",
     "pending_approval_desc": "AI 想要调用工具「{{toolName}}」继续完成任务。在你点击\"同意\"或\"拒绝\"之前，生成会暂停。",
     "pending_approve": "同意",
-    "pending_deny": "拒绝"
+    "pending_deny": "拒绝",
+    "deny_dialog_title": "拒绝工具调用",
+    "deny_dialog_desc": "可以填写拒绝原因（可选），会一并反馈给 AI，帮助它调整后续做法。",
+    "deny_dialog_placeholder": "拒绝原因（可选）",
+    "deny_dialog_confirm": "确认拒绝",
+    "deny_dialog_cancel": "取消"
   },
   "media_part": {
     "video_load_failed": "加载视频失败：{{url}}",
     "open_video_in_new_window": "在新窗口打开视频",
     "audio_load_failed": "加载音频失败：{{url}}",
     "open_audio_in_new_window": "在新窗口打开音频"
+  },
+  "workspace_tool": {
+    "read": "读取文件",
+    "read_title": "读取文件：{{path}}",
+    "read_range_both": "第 {{offset}} 行起 · {{limit}} 行",
+    "read_range_offset": "第 {{offset}} 行起",
+    "read_range_limit": "前 {{limit}} 行",
+    "write_title": "写入文件",
+    "write_title_with_path": "写入文件：{{path}}",
+    "edit_title": "编辑文件",
+    "edit_title_with_path": "编辑文件：{{path}}",
+    "bytes": "{{bytes}} 字节",
+    "no_output": "（无输出）",
+    "open_details": "查看详情",
+    "patch": "补丁（unified diff）",
+    "write_preview_more": "…其余 {{count}} 行见详情",
+    "diff_empty": "无变更",
+    "diff_show_more": "展开其余 {{count}} 行",
+    "terminal_hidden_lines": "已隐藏前 {{count}} 行，完整输出见详情",
+    "copy_output": "复制输出",
+    "copied": "已复制",
+    "approval_read": "AI 请求读取文件",
+    "approval_write": "AI 请求写入文件",
+    "approval_edit": "AI 请求编辑文件",
+    "approval_bash": "AI 请求执行命令",
+    "approval_hint": "请确认后批准，AI 将在你的工作区内执行该操作",
+    "approval_reason": "触发审批：{{reason}}",
+    "bash_prefix": "执行命令：",
+    "grep": "搜索内容",
+    "grep_title": "搜索内容：{{pattern}}",
+    "find": "查找文件",
+    "find_title": "查找文件：{{pattern}}",
+    "ls": "列出目录",
+    "ls_title": "列出目录：{{path}}"
   }
 }

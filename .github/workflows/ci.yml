@@ -16,7 +16,25 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: '1.3.13'
+          bun-version: '1.4.0'
+
+      # pi/ 是 gitignore 的本地浅克隆(vendored 源码),不进仓库。pc-server 直接
+      # import 其 TS 源码,缺它 tsc 报 57 个找不到模块。按 CLAUDE.md「pi vendor
+      # 维护手册」重建:浅克隆上游基线 + 应用 pi-patches/*.patch。
+      # 装 pi 自己的依赖(proper-lockfile/typebox/openai 等,bun build 会把它们
+      # 一并打包;缺了 bun build 报 Could not resolve)。pi 的 bun.lock 是
+      # lockfileVersion 1,Bun 1.4.0 会迁移它,故不能用 --frozen-lockfile。
+      # packages/ai/src/providers/data/.manifest.json 是构建期生成物、git 不跟踪,
+      # 由 generate-models 从 models.dev 拉取生成(需网络,CI 有)。
+      - name: Restore pi vendor
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/earendil-works/pi.git pi
+          cd pi
+          git checkout 5cd93f688aaab89dbb6dfa4aca535f21796ae185
+          git reset --hard
+          git apply ../pi-patches/*.patch
+          bun install
+          cd packages/ai && bun run generate-models
 
       - name: Install pc-server dependencies
         working-directory: pc-server
@@ -28,7 +46,13 @@ jobs:
 
       - name: Run pc-server unit tests
         working-directory: pc-server
-        run: bun test
+        run: |
+          # embedded-bash.ts 顶层 import ../../assets/bash-bundle.tar.gz(Windows-only
+          # 构建产物,gitignored)。Linux CI 无法生成,但 bun test 需要解析该 import。
+          # 创建 dummy 文件让解析成功;embedded-bash.test.ts 在非 Windows 平台会跳过。
+          mkdir -p assets
+          [ -f assets/bash-bundle.tar.gz ] || echo "dummy" > assets/bash-bundle.tar.gz
+          bun test
 
       - name: Run request-chain smoke
         working-directory: pc-server
@@ -51,7 +75,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: '1.3.13'
+          bun-version: '1.4.0'
 
       - name: Install web-ui dependencies
         working-directory: web-ui

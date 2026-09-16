@@ -8,6 +8,7 @@ import {
   CheckSquare,
   Images,
   Languages,
+  Moon,
   MoreHorizontal,
   MoveRight,
   Palette,
@@ -20,6 +21,7 @@ import {
   LogOut,
   Settings,
   Square,
+  Sun,
   Trash2,
   X,
 } from "lucide-react";
@@ -31,6 +33,7 @@ import { AvatarCropper } from "~/components/avatar-cropper";
 import { RenameConversationDialog } from "~/components/rename-conversation-dialog";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
+import { SidebarBrandRow } from "~/components/sidebar-brand";
 import {
   Dialog,
   DialogContent,
@@ -64,6 +67,7 @@ import {
   SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuItem,
+  SidebarTrigger,
 } from "~/components/ui/sidebar";
 import { UIAvatar } from "~/components/ui/ui-avatar";
 import {
@@ -79,6 +83,7 @@ import { cn } from "~/lib/utils";
 import { refreshSettingsStore } from "~/lib/settings-sync";
 import { clearWebAuthToken } from "~/services/api";
 import { confirmDialog } from "~/stores/confirm-store";
+import { useConversationEngineStatus } from "~/stores/conversation-store";
 import api from "~/services/api";
 import type { AssistantAvatar, AssistantProfile, AssistantTag, ConversationListDto } from "~/types";
 
@@ -239,6 +244,11 @@ const ConversationListRow = React.memo(
     const [menuOpen, setMenuOpen] = React.useState(false);
     const [pendingAction, setPendingAction] = React.useState<string | null>(null);
     const [renameOpen, setRenameOpen] = React.useState(false);
+    // 域4-1(交互审查 2A):生成中绿点升级为双态——琥珀=有工具审批在等待用户裁决,
+    // 仍归"生成中"语义(approval 等待期间 isGenerating 保持 true),故琥珀取代而非并列。
+    // 窄选择器订阅本行会话的瞬态状态,压缩/重试/审批帧跳变才重渲染本行。
+    const engineStatus = useConversationEngineStatus(conversation.id);
+    const awaitingApproval = engineStatus?.phase === "awaiting_approval";
 
     const moveTargets = React.useMemo(
       () => assistants.filter((assistant) => assistant.id !== conversation.assistantId),
@@ -311,9 +321,12 @@ const ConversationListRow = React.memo(
               {conversation.isPinned && <Pin className="size-3 text-primary" aria-hidden />}
               {conversation.isGenerating && (
                 <span
-                  className="inline-block size-2 rounded-full bg-emerald-500"
-                  aria-label={t("conversation_sidebar.generating")}
-                  title={t("conversation_sidebar.generating")}
+                  className={cn(
+                    "inline-block size-2 rounded-full",
+                    awaitingApproval ? "animate-pulse bg-warning" : "bg-success",
+                  )}
+                  aria-label={t(awaitingApproval ? "conversation_sidebar.awaiting_approval" : "conversation_sidebar.generating")}
+                  title={t(awaitingApproval ? "conversation_sidebar.awaiting_approval" : "conversation_sidebar.generating")}
                 />
               )}
             </span>
@@ -513,7 +526,38 @@ function resolveLanguage(language: string): (typeof LANGUAGE_OPTIONS)[number]["v
   return language.startsWith("zh") ? "zh-CN" : "en-US";
 }
 
-function LanguageSwitcher() {
+// 明暗切换(前端重构A1):自主副标题卡迁入侧栏底部,与主题色入口相邻。
+function ThemeModeToggle() {
+  const { theme, setTheme } = useTheme();
+  const { t } = useTranslation("page");
+  // "system" 先落成具体明暗,保证点击总是切到相反模式。
+  const isDark =
+    theme === "dark" ||
+    (theme === "system" &&
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-color-scheme: dark)").matches);
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon-sm"
+      className="text-muted-foreground hover:text-foreground"
+      onClick={() => setTheme(isDark ? "light" : "dark")}
+      aria-label={
+        isDark ? t("conversations.theme_toggle.to_light") : t("conversations.theme_toggle.to_dark")
+      }
+      title={
+        isDark ? t("conversations.theme_toggle.to_light") : t("conversations.theme_toggle.to_dark")
+      }
+    >
+      {isDark ? <Moon className="size-4" /> : <Sun className="size-4" />}
+    </Button>
+  );
+}
+
+// 入口暂撤(前端重构A1,用户指示):Language 切换按钮不再挂在侧栏底部,组件与切换
+// 功能完整保留,计划未来落位设置页;export 避免未使用告警并供届时复用。
+export function LanguageSwitcher() {
   const { i18n } = useTranslation();
   const currentLanguage = resolveLanguage(i18n.resolvedLanguage ?? i18n.language);
   const currentOption =
@@ -528,7 +572,6 @@ function LanguageSwitcher() {
           className="text-muted-foreground hover:text-foreground"
           type="button"
           aria-label={`Language: ${currentOption.label}`}
-          title={`Language: ${currentOption.label}`}
         >
           <Languages className="size-4" />
         </Button>
@@ -816,11 +859,18 @@ export const ConversationSidebar = React.memo(
     return (
       <Sidebar collapsible="offcanvas" variant="sidebar">
         <SidebarHeader>
+          {/* 品牌行(G8/I5):只留 Logo+应用名(折叠钮已挪到用户资料行右侧);
+              I1:与右侧窗控带同属顶部窗控行,整行可拖拽窗口。
+              问题7回访:抽成 SidebarBrandRow,设置页/图像页同源延续。 */}
+          <SidebarBrandRow className="-mt-1 pl-2 pr-0.5" />
+          {/* 用户资料行(F1:按用户要求保持顶部,不学 NewMax 的用户归底);
+              I5:折叠钮居其右侧垂直居中。 */}
+          <div className="flex items-center gap-1">
           <Dialog open={profileOpen} onOpenChange={setProfileOpen}>
             <DialogTrigger asChild>
               <button
                 type="button"
-                className="flex w-full items-center gap-3 rounded-lg px-2.5 py-2.5 text-left transition hover:bg-sidebar-accent"
+                className="flex min-w-0 flex-1 items-center gap-3 rounded-lg px-2.5 py-2.5 text-left transition hover:bg-sidebar-accent"
               >
                 <UIAvatar
                   size="default"
@@ -885,17 +935,19 @@ export const ConversationSidebar = React.memo(
               </DialogFooter>
             </DialogContent>
           </Dialog>
+          <SidebarTrigger className="mr-0.5 shrink-0 text-muted-foreground hover:text-foreground" />
+          </div>
         </SidebarHeader>
         <SidebarContent className="min-h-0">
           <SidebarGroup>
             <div className="space-y-1">
               <Button
-                variant="default"
+                variant="ghost"
                 size="sm"
-                className="w-full justify-start gap-2 shadow-sm"
+                className="h-9 w-full justify-start gap-3 rounded-[10px] px-2 font-medium text-[var(--ds-text-primary)]"
                 onClick={onCreateConversation}
               >
-                <Plus className="size-4" />
+                <Plus className="size-[18px] text-[var(--ds-icon)]" strokeWidth={1.75} />
                 {t("conversation_sidebar.new_conversation")}
               </Button>
 
@@ -932,11 +984,11 @@ export const ConversationSidebar = React.memo(
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="w-full justify-start"
+                  className="h-9 w-full justify-start gap-3 rounded-[10px] px-2 font-medium text-[var(--ds-text-primary)]"
                   onClick={() => setSelectionMode(true)}
                   disabled={!onDeleteMany || conversations.length === 0}
                 >
-                  <CheckSquare className="size-4" />
+                  <CheckSquare className="size-[18px] text-[var(--ds-icon)]" strokeWidth={1.75} />
                   {t("conversation_sidebar.multi_select_delete")}
                 </Button>
               )}
@@ -975,7 +1027,7 @@ export const ConversationSidebar = React.memo(
                   if (listItem.type === "pinned-header") {
                     return (
                       <SidebarMenuItem key="pinned_header">
-                        <div className="flex items-center gap-1.5 px-2 py-1.5 text-xs font-semibold text-primary">
+                        <div className="flex items-center gap-1.5 px-2 py-1.5 text-xs font-semibold text-[var(--ds-text-secondary)]">
                           <Pin className="size-3" />
                           {t("conversation_sidebar.pinned")}
                         </div>
@@ -985,7 +1037,7 @@ export const ConversationSidebar = React.memo(
                   if (listItem.type === "date-header") {
                     return (
                       <SidebarMenuItem key={`date_${listItem.date}`}>
-                        <div className="px-2 py-1.5 text-xs font-semibold text-primary">
+                        <div className="px-2 py-1.5 text-xs font-semibold text-[var(--ds-text-secondary)]">
                           {listItem.label}
                         </div>
                       </SidebarMenuItem>
@@ -1184,8 +1236,6 @@ export const ConversationSidebar = React.memo(
               </Link>
             </Button>
 
-            <LanguageSwitcher />
-
             <DropdownMenu open={themeMenuOpen} onOpenChange={setThemeMenuOpen}>
               <DropdownMenuTrigger asChild>
                 <Button
@@ -1194,9 +1244,6 @@ export const ConversationSidebar = React.memo(
                   className="text-muted-foreground hover:text-foreground"
                   type="button"
                   aria-label={t("conversation_sidebar.theme_color_label", {
-                    label: currentColorLabel,
-                  })}
-                  title={t("conversation_sidebar.theme_color_label", {
                     label: currentColorLabel,
                   })}
                 >
@@ -1240,7 +1287,7 @@ export const ConversationSidebar = React.memo(
                         >
                           <span className="flex-1 truncate">{ut.name}</span>
                           <Check className={selected ? "size-4" : "size-4 opacity-0"} />
-                          <span className="absolute right-1 flex items-center gap-0.5 rounded-sm bg-popover/80 px-1 opacity-0 backdrop-blur-sm transition-opacity group-hover:opacity-100">
+                          <span className="absolute right-1 flex items-center gap-0.5 rounded-sm bg-popover/80 px-1 opacity-0 transition-opacity group-hover:opacity-100">
                             <button
                               type="button"
                               className="rounded p-1 text-muted-foreground hover:text-foreground"
@@ -1280,6 +1327,8 @@ export const ConversationSidebar = React.memo(
               </DropdownMenuContent>
             </DropdownMenu>
 
+            <ThemeModeToggle />
+
             <a
               href="https://rikkahub-desktop.pages.dev/"
               target="_blank"
@@ -1290,6 +1339,7 @@ export const ConversationSidebar = React.memo(
               RikkaHub
             </a>
           </div>
+
         </SidebarFooter>
       </Sidebar>
     );

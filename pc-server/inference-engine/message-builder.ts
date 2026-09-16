@@ -5,9 +5,28 @@
 import { existsSync, readFileSync } from "node:fs";
 import type { ApiMessage, Assistant, JsonValue, Message, MessagePart, Model, Provider, ToolOutputEntry } from "../foundation/types";
 import { id, isRecord } from "../foundation/utils";
+import {
+  ARK_SEED2_EFFORT_BY_LEVEL,
+  budgetTokensFor,
+  deepseekEffortFor,
+  effortLowHighMaxFor,
+  gemini3ThinkingLevelFor,
+  isArkSeed2Model,
+  isKimiK26Model,
+  isKimiK27Model,
+  isKimiK3Model,
+  isSamplingLockedModel,
+  isSiliconFlowEffortModel,
+  isZhipuEffortModel,
+  isZhipuForcedThinkingModel,
+  isZhipuGlm53Model,
+  reasoningLevelNormalized,
+  SILICONFLOW_THINKING_MODELS,
+  ZHIPU_GLM53_EFFORT_BY_LEVEL,
+} from "../model-providers/request-dialect";
 import { fallbackDocumentText, readExtractedTextSync } from "../files/index";
 import { ensureExtractedTextAsync } from "../files/extraction";
-import { parseToolInput, resolvedToolOutput } from "../tools/format";
+import { UNRESOLVED_TOOL_RESULT_TEXT, parseToolInput, toolArgumentsJson, toolResultTextForApi } from "../tools/format";
 import { state } from "../persistence/json-store";
 
 export function fileEntryFromApiUrl(url: string) {
@@ -188,7 +207,11 @@ export function claudeBlocksFromUiParts(parts: ToolOutputEntry[]) {
       });
     }
   }
-  return blocks.length ? blocks : [claudeTextBlock("")];
+  // 无可投影内容时给确定性占位而非空 text block:Anthropic 明确拒空文本块(400
+  // "text content blocks must be non-empty",见下方 claudeMessagesFromApiMessages 头注),
+  // 空 tool_result 正是触发形态。占位与 OpenAI 系的 toolResultTextForApi 同一常量,
+  // 三家 provider 对"有调用无结果"的回灌表述统一。
+  return blocks.length ? blocks : [claudeTextBlock(UNRESOLVED_TOOL_RESULT_TEXT)];
 }
 
 
@@ -448,14 +471,15 @@ export function googleGenerationConfig(modelItem: Model, assistant: Assistant) {
     const thinkingConfig: Record<string, JsonValue> = { includeThoughts: true };
     if (normalized === "off") {
       if (isGemini3) {
-        thinkingConfig.thinkingLevel = "minimal";
+        // Gemini 3 思考不可关：off 取该型号的最少思考档（Pro 无 minimal，表内收 low）。
+        thinkingConfig.thinkingLevel = gemini3ThinkingLevelFor(modelItem.modelId, "minimal");
       } else if (!isGeminiPro) {
         thinkingConfig.thinkingBudget = 0;
         thinkingConfig.includeThoughts = false;
       }
     } else if (normalized !== "auto") {
       if (isGemini3) {
-        thinkingConfig.thinkingLevel = normalized === "low" ? "low" : normalized === "medium" ? "medium" : "high";
+        thinkingConfig.thinkingLevel = gemini3ThinkingLevelFor(modelItem.modelId, normalized);
       } else {
         thinkingConfig.thinkingBudget = budgetTokensFor(normalized);
       }
@@ -531,7 +555,7 @@ export function appendAssistantApiMessages(items: ApiMessage[], message: Message
           type: "function",
           function: {
             name: String(record.toolName ?? ""),
-            arguments: String(record.input ?? "{}"),
+            arguments: toolArgumentsJson(record.input),
           },
         };
       });
@@ -576,7 +600,7 @@ export function appendAssistantApiMessages(items: ApiMessage[], message: Message
         role: "tool",
         name: String(part.toolName ?? ""),
         tool_call_id: String(part.toolCallId ?? ""),
-        content: resolvedToolOutput(part),
+        content: toolResultTextForApi(part),
         _rikkahub_tool_output_parts: Array.isArray(part.output) ? part.output : [],
       });
     }
@@ -585,17 +609,9 @@ export function appendAssistantApiMessages(items: ApiMessage[], message: Message
 }
 
 
-export function reasoningLevelNormalized(level: string | null | undefined) {
-  const normalized = String(level ?? "").toLowerCase();
-  return normalized === "off" || normalized === "none" ? "off" : normalized;
-}
+// reasoningLevelNormalized 上提至 model-providers/request-dialect(方言单源,工作区引擎同用)。
 
-// Token budgets per level — mirrors Android's ReasoningLevel enum values.
-
-export function budgetTokensFor(level: string): number {
-  const map: Record<string, number> = { off: 0, low: 1_000, medium: 2_000, high: 8_000, xhigh: 16_000 };
-  return map[level] ?? 8_000;
-}
+// budgetTokensFor 上提至 model-providers/request-dialect(方言单源,工作区引擎同用)。
 
 // DeepSeek 系列模型的特色是展示原始思维链。当 DeepSeek 走 Anthropic(Claude) 格式时，
 // 用 display:"raw" 而非 "summarized"，让用户看到完整的思维链而非摘要。其它模型保持
@@ -704,26 +720,6 @@ export function apiContentText(content: unknown) {
 }
 
 
-export function responseApiContent(content: unknown, role: string) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return apiContentText(content);
-  return content
-    .map((part) => {
-      if (!isRecord(part)) return null;
-      const text = String(part.text ?? part.content ?? "");
-      if (text) {
-        return {
-          type: role === "assistant" ? "output_text" : "input_text",
-          text,
-        };
-      }
-      if (part.type === "image_url") return part;
-      return null;
-    })
-    .filter(Boolean);
-}
-
-
 export function responseApiContentFromUiParts(parts: JsonValue[], role: string) {
   const content = documentPartsFirst(parts)
     .map((part) => {
@@ -750,8 +746,10 @@ export function responseApiContentFromUiParts(parts: JsonValue[], role: string) 
       return null;
     })
     .filter(Boolean);
-  if (content.length === 1 && isRecord(content[0]) && content[0].type === "input_text") return String(content[0].text ?? "");
-  if (content.length === 1 && isRecord(content[0]) && content[0].type === "output_text") return String(content[0].text ?? "");
+  const singlePart = content.length === 1 ? content[0] : undefined;
+  if (isRecord(singlePart) && (singlePart.type === "input_text" || singlePart.type === "output_text") && "text" in singlePart) {
+    return String(singlePart.text ?? "");
+  }
   return content;
 }
 
@@ -814,7 +812,11 @@ export function responseApiImageGenerationItem(part: Record<string, JsonValue>) 
 }
 
 
-export function responseApiMessagesFromUiMessages(messages: Message[], targetModel?: Model) {
+/** UI 消息 → Responses API input 项数组。includeReasoningItems 控制历史 reasoning
+ *  项（{type:"reasoning", summary:[…]}）是否回传：OpenAI 私有形态，仅官方主机接受，
+ *  第三方端点（火山等）解析不了直接 400——判定在调用方（conversationResponseApiInput）
+ *  按主机方言 + provider 开关决定，本函数默认 true 跟随 OpenAI 官方语义。 */
+export function responseApiMessagesFromUiMessages(messages: Message[], targetModel?: Model, includeReasoningItems = true) {
   const stripImageForOcr = targetModel ? !supportsInputModality(targetModel, "IMAGE") : false;
   const items: ApiMessage[] = [];
   for (const messageValue of messages) {
@@ -833,8 +835,10 @@ export function responseApiMessagesFromUiMessages(messages: Message[], targetMod
         if (!isRecord(part)) continue;
         if (part.type === "reasoning") {
           flushContent();
-          const reasoningItem = responseApiReasoningItem(part);
-          if (reasoningItem) items.push(reasoningItem);
+          if (includeReasoningItems) {
+            const reasoningItem = responseApiReasoningItem(part);
+            if (reasoningItem) items.push(reasoningItem);
+          }
           continue;
         }
         if (part.type === "image") {
@@ -859,12 +863,12 @@ export function responseApiMessagesFromUiMessages(messages: Message[], targetMod
             type: "function_call",
             call_id: String(part.toolCallId ?? ""),
             name: String(part.toolName ?? ""),
-            arguments: String(part.input ?? "{}"),
+            arguments: toolArgumentsJson(part.input),
           });
           items.push({
             type: "function_call_output",
             call_id: String(part.toolCallId ?? ""),
-            output: resolvedToolOutput(part),
+            output: toolResultTextForApi(part),
           });
         }
       }
@@ -892,55 +896,11 @@ export function responseApiMessagesFromUiMessages(messages: Message[], targetMod
 }
 
 
-export function responseApiMessages(messagesForApi: ApiMessage[]) {
-  const items: ApiMessage[] = [];
-  for (const item of messagesForApi) {
-    if (item.role === "system") continue;
-    if (item.role === "assistant") {
-      const content = responseApiContent(item.content, "assistant");
-      if ((typeof content === "string" && content.trim()) || (Array.isArray(content) && content.length)) {
-        items.push({ role: "assistant", content });
-      }
-      const toolCalls = Array.isArray(item.tool_calls) ? item.tool_calls : [];
-      for (const toolCall of toolCalls) {
-        const fn = toolCall?.function ?? {};
-        items.push({
-          type: "function_call",
-          call_id: String(toolCall.id ?? ""),
-          name: String(fn.name ?? ""),
-          arguments: String(fn.arguments ?? ""),
-        });
-      }
-      continue;
-    }
-    if (item.role === "tool") {
-      items.push({
-        type: "function_call_output",
-        call_id: String(item.tool_call_id ?? ""),
-        output: apiContentText(item.content),
-      });
-      continue;
-    }
-    items.push({ role: item.role, content: responseApiContent(item.content, String(item.role ?? "user")) });
-  }
-  return items;
-}
-
-
-export function responseApiInstructions(messagesForApi: ApiMessage[]) {
-  return messagesForApi
-    .filter((item) => item.role === "system")
-    .map((item) => apiContentText(item.content))
-    .filter(Boolean)
-    .join("\n");
-}
-
-
 export function isModelAllowTemperature(modelItem: Model) {
-  // Mirror Android's ModelRegistry-based check: OPENAI_O_MODELS (o1, o3, o4 etc.)
-  // and GPT_5 (exact "gpt-5" only — NOT gpt-5.1, gpt-5.2 etc., which Android allows).
-  const id = modelItem.modelId;
-  return !/(^o\d|[/:_-]o\d)/i.test(id) && !/^gpt[-._]?5$/i.test(id);
+  // 薄壳:锁定事实单源在 request-dialect.isSamplingLockedModel(o 系/精确 gpt-5/
+  // Kimi K2.5+,依据见彼处);orchestrator 主对话与 auxiliary 的 temperature/top_p
+  // 都经本函数,未来引擎接采样设置时直接消费方言谓词。
+  return !isSamplingLockedModel(modelItem.modelId);
 }
 
 
@@ -966,46 +926,68 @@ export function reasoningPayloadForProvider(providerItem: Provider, modelItem: M
   }
   if (host === "dashscope.aliyuncs.com") {
     const result: Record<string, any> = { enable_thinking: enabled };
-    if (normalized !== "auto") result.thinking_budget = budgetTokensFor(normalized);
+    // 百炼官方:thinking_budget 适用 Qwen3 系与直供 GLM/Kimi,唯 kimi-k3 不支持该参数。
+    if (normalized !== "auto" && !isKimiK3Model(modelItem.modelId)) result.thinking_budget = budgetTokensFor(normalized);
     return result;
   }
   if (host === "api.siliconflow.cn") {
-    const siliconflowThinkingModels = new Set([
-      "Pro/moonshotai/Kimi-K2.5",
-      "Pro/zai-org/GLM-5",
-      "Pro/zai-org/GLM-5.1",
-      "Pro/zai-org/GLM-4.7",
-      "deepseek-ai/DeepSeek-V3.2",
-      "Pro/deepseek-ai/DeepSeek-V3.2",
-      "Qwen/Qwen3.5-397B-A17B",
-      "Qwen/Qwen3.5-122B-A10B",
-      "Qwen/Qwen3.5-35B-A3B",
-      "Qwen/Qwen3.5-27B",
-      "Qwen/Qwen3.5-9B",
-      "Qwen/Qwen3.5-4B",
-      "zai-org/GLM-4.6",
-      "Qwen/Qwen3-8B",
-      "Qwen/Qwen3-14B",
-      "Qwen/Qwen3-32B",
-      "Qwen/Qwen3-30B-A3B",
-      "tencent/Hunyuan-A13B-Instruct",
-      "zai-org/GLM-4.5V",
-      "deepseek-ai/DeepSeek-V3.1-Terminus",
-      "Pro/deepseek-ai/DeepSeek-V3.1-Terminus",
-      "deepseek-ai/DeepSeek-V4-Flash",
-      "Pro/deepseek-ai/DeepSeek-V4-Flash",
-      "deepseek-ai/DeepSeek-V4-Pro",
-      "Pro/deepseek-ai/DeepSeek-V4-Pro",
-    ]);
-    return siliconflowThinkingModels.has(modelItem.modelId) ? { enable_thinking: enabled } : {};
+    // 白名单单源在 request-dialect(工作区引擎经 model-bridge 消费同一份名单)。
+    // V4 系/GLM-5.2 托管版另支持 reasoning_effort(服务端自行收拢 low/medium→high、
+    // xhigh→max),原样透传与 enable_thinking 并发。
+    if (!SILICONFLOW_THINKING_MODELS.has(modelItem.modelId)) return {};
+    const sfEffort = enabled && normalized !== "auto" && isSiliconFlowEffortModel(modelItem.modelId) ? normalized : undefined;
+    return { enable_thinking: enabled, ...(sfEffort ? { reasoning_effort: sfEffort } : {}) };
   }
-  if (["ark.cn-beijing.volces.com", "open.bigmodel.cn", "api.moonshot.cn", "api.deepseek.com"].includes(host)) {
-    return { thinking: { type: enabled ? "enabled" : "disabled" }, ...(host === "api.deepseek.com" && enabled && normalized !== "auto" ? { reasoning_effort: normalized } : {}) };
+  if (host === "api.moonshot.cn") {
+    // Kimi 逐代 thinking 语义(官方"思考模型"文档;安卓仅覆盖到 K2.6 #1586,K3 为 PC 先行。
+    // 代际判定与 K3 档位收拢表单源在 request-dialect,pi 引擎消费同一张表):
+    // - K3:始终思考+保留式思考常开,thinking 参数已移除(官方明示"不应传入",对照
+    //   K2.7-code 传 disabled 直接 400);推理强度改用顶层 reasoning_effort,仅
+    //   low/high/max 三档(默认 max)。off 无法关思考,映射 low(官方 FAQ:嫌思考久
+    //   就调 low);auto 不发字段,用服务端默认。
+    // - K2.7-code:始终思考,传 {type:"disabled"} 报错;省略 thinking 即 keep:"all"
+    //   语义,故一律不发。
+    // - K2.6:thinking{type} 可开关;开启时需显式 keep:"all" 才保留历史思考(#1586)。
+    // - 其余(K2.5/kimi-latest 等):维持 thinking{type} 开关,与安卓一致。
+    if (isKimiK3Model(modelItem.modelId)) {
+      if (normalized === "auto") return {};
+      if (!enabled) return { reasoning_effort: "low" };
+      return { reasoning_effort: effortLowHighMaxFor(normalized) ?? "high" };
+    }
+    if (isKimiK27Model(modelItem.modelId)) return {};
+    const thinking: Record<string, any> = { type: enabled ? "enabled" : "disabled" };
+    if (enabled && isKimiK26Model(modelItem.modelId)) thinking.keep = "all";
+    return { thinking };
+  }
+  if (["ark.cn-beijing.volces.com", "open.bigmodel.cn", "api.deepseek.com"].includes(host)) {
+    // thinking:{type} 生态的 effort 增强(模型级方言,2026-09 各厂官方口径,pi 引擎经
+    // thinkingLevelMap 消费同源表,两引擎口径恒同):
+    // - DeepSeek 官方:v4 收拢表(xhigh→high,与 K3 表口径不同,勿混用);
+    // - 智谱 GLM-5.2+:5.3 系查窄表(服务端仅收 max/high/low,其余 400),5.2 原样透传
+    //   (服务端收全七档自行收拢);5.1 及以下不发 effort;
+    // - 火山方舟 Doubao Seed 2.x:查 seed2 表(仅收 minimal/low/medium/high);老系不发。
+    let effort: string | undefined;
+    if (enabled && normalized !== "auto") {
+      if (host === "api.deepseek.com") {
+        effort = deepseekEffortFor(normalized);
+      } else if (host === "open.bigmodel.cn" && isZhipuEffortModel(modelItem.modelId)) {
+        effort = isZhipuGlm53Model(modelItem.modelId)
+          ? (ZHIPU_GLM53_EFFORT_BY_LEVEL as Record<string, string>)[normalized]
+          : normalized;
+      } else if (host === "ark.cn-beijing.volces.com" && isArkSeed2Model(modelItem.modelId)) {
+        effort = (ARK_SEED2_EFFORT_BY_LEVEL as Record<string, string>)[normalized];
+      }
+    }
+    // 智谱强制思考型号(GLM-5.3 系/4.7/4.5V):思考不可关,off 档发 disabled 直接 400——
+    // 省略 thinking 字段走模型默认(恒思考),与 K3"off 不可达"同语义。
+    if (host === "open.bigmodel.cn" && isZhipuForcedThinkingModel(modelItem.modelId) && !enabled) return {};
+    return { thinking: { type: enabled ? "enabled" : "disabled" }, ...(effort ? { reasoning_effort: effort } : {}) };
   }
   if (host === "integrate.api.nvidia.com") {
     if (normalized === "auto") return {};
     if (modelItem.modelId.toLowerCase().includes("deepseek-v4")) {
-      if (normalized === "xhigh") return { reasoning_effort: "max" };
+      // 对齐 Android ChatCompletionsAPI:384-390——xhigh/max 都升 "max",其余非 off 归 "high"。
+      if (normalized === "xhigh" || normalized === "max") return { reasoning_effort: "max" };
       if (normalized === "off") return { reasoning_effort: "none" };
       return { reasoning_effort: "high" };
     }
@@ -1024,14 +1006,15 @@ export function reasoningPayloadForProvider(providerItem: Provider, modelItem: M
     const thinkingConfig: Record<string, any> = { include_thoughts: true };
     if (normalized === "off") {
       if (isGemini3) {
-        thinkingConfig.thinking_level = "minimal";
+        // 同原生路径：off 取该型号最少思考档（档位表单源 request-dialect）。
+        thinkingConfig.thinking_level = gemini3ThinkingLevelFor(modelItem.modelId, "minimal");
       } else if (!isGeminiPro) {
         thinkingConfig.thinking_budget = 0;
         thinkingConfig.include_thoughts = false;
       }
     } else if (normalized !== "auto") {
       if (isGemini3) {
-        thinkingConfig.thinking_level = normalized === "low" ? "low" : normalized === "medium" ? "medium" : "high";
+        thinkingConfig.thinking_level = gemini3ThinkingLevelFor(modelItem.modelId, normalized);
       } else {
         thinkingConfig.thinking_budget = budgetTokensFor(normalized);
       }
@@ -1042,6 +1025,10 @@ export function reasoningPayloadForProvider(providerItem: Provider, modelItem: M
   // OFF maps to "low" (lowest budget), AUTO sends no field.
   if (normalized === "auto") return {};
   if (normalized === "off") return { reasoning_effort: "low" };
+  // K3 经透传型中转(未知 host)同样只认 low/high/max——档位收拢与 moonshot 官方
+  // 分支、pi 引擎共用 request-dialect 同一张表;网关型 host(OpenRouter/DashScope
+  // 等)有自己的方言翻译,已在上方各自分支返回,不经此兜底。
+  if (isKimiK3Model(modelItem.modelId)) return { reasoning_effort: effortLowHighMaxFor(normalized) ?? "high" };
   return { reasoning_effort: normalized };
 }
 

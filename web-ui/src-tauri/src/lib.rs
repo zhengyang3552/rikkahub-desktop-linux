@@ -57,13 +57,11 @@ fn request_sidecar_shutdown(port: u16) -> bool {
     let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
     // 服务端刷盘(state 尾随写追平 + 活库 reconcile + checkpoint)通常毫秒级,给足 2.5s。
     let _ = stream.set_read_timeout(Some(Duration::from_millis(2500)));
+    // HTTP/1.1 头部行结束符必须是 CRLF:Rust 多行字符串字面量的换行会被规范化成 bare LF,
+    // Bun 的解析器直接拒收(505 HTTP Version Not Supported)——曾导致优雅停机从未成功、
+    // 每次退出都走硬杀,pending 取证残留,下次启动误报"上次未正常退出"(日志问题 2 真根因)。
     let request = format!(
-        "POST /api/app/shutdown HTTP/1.1
-Host: 127.0.0.1:{port}
-Content-Length: 0
-Connection: close
-
-"
+        "POST /api/app/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
@@ -288,9 +286,8 @@ fn startup_failure_message(fatal_message: &Mutex<Option<String>>) -> String {
     if let Some(message) = fatal_message.lock().unwrap().clone() {
         return format!("Rikkahub 启动失败：\n\n{message}");
     }
-    "Rikkahub 启动失败：后端进程意外退出，且未留下诊断信息。\n\n\
-     可能原因：程序文件损坏、数据目录不可写、或被安全软件拦截。\n\
-     请重新启动试试；若反复出现，请重新安装 Rikkahub。"
+    "Rikkahub 启动失败：后端进程意外退出。\n\n\
+     请重启尝试，诊断信息见应用安装目录下 pc-data/logs/server.log。"
         .to_string()
 }
 
@@ -686,15 +683,21 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_os::init())
+        // 域4-1(专题-交互审查 2A):审批等待桌面通知——AI 等审批而窗口失焦时提醒。
+        .plugin(tauri_plugin_notification::init())
         // 专题8:记忆窗口尺寸/位置/最大化状态,退出时保存、启动时恢复。
         // D12(复查):排除 VISIBLE——可见性由应用自己管(就绪后 show、托盘 hide),
         // 插件若恢复"上次退出时隐藏在托盘"的不可见态,下次启动窗口不出现;若过早
         // 恢复可见又会在前端就绪前闪白屏。
+        // H1:排除 DECORATIONS——窗饰是应用设计决策(G 轮回归原生标题栏),不是用户
+        // 窗口状态;不排除的话,插件会把无边框时代存下的 decorations:false 恢复回去,
+        // 导致升级后"缩小/放大/关闭"行整个消失。
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(
                     tauri_plugin_window_state::StateFlags::all()
-                        & !tauri_plugin_window_state::StateFlags::VISIBLE,
+                        & !tauri_plugin_window_state::StateFlags::VISIBLE
+                        & !tauri_plugin_window_state::StateFlags::DECORATIONS,
                 )
                 .build(),
         )

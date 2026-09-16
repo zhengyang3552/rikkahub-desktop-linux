@@ -35,6 +35,8 @@ export function deleteConversationsById(ids: Set<string>) {
     // R2-4+R2-6:close 详情流 + 清待发节点广播(见 dropConversationSse 注释)
     dropConversationSse(conversationId);
   }
+  // P7:引擎会话状态(压缩记录)在会话行内(engine_compactions 列),随行删除天然级联,
+  // 无文件生命周期可管——P2 的 jsonl 收集/删除逻辑随层退役。
   // 先删 working set,再删活库——避免删活库后残余脏标记 flush 又把节点 upsert 回来
   // (flushConvDirty 经 peekConversation 查注册表,条目没了就跳过)。
   removeConversations(ids);
@@ -57,7 +59,9 @@ export function seedConversationInjectionBinding(conversation: Conversation, ass
   conversation.lorebookIds = getStringArray(assistant.lorebookIds);
 }
 
-export function ensureConversation(idValue: string) {
+/** init 仅在会话创建时刻生效(已存在的会话原样返回)——PC 会话首条消息才建档,
+ *  工作区归属等创建期属性只能随首个建档请求进来,事后不可改绑。 */
+export function ensureConversation(idValue: string, init?: { workspaceId?: string | null }) {
   let conversation = getConversation(idValue);
   if (!conversation) {
     const now = Date.now();
@@ -72,6 +76,9 @@ export function ensureConversation(idValue: string) {
       isPinned: false,
       createAt: now,
       updateAt: now,
+      workspaceId: init?.workspaceId ?? null,
+      workspaceCwd: null,
+      engineCompactions: null,
     };
     seedConversationInjectionBinding(conversation, assistant);
     registerConversation(conversation); // 新建:内存即权威,防 checkout 从活库读空树反向覆盖
@@ -129,23 +136,70 @@ export function appendTextPart(msg: Message, text: string) {
 export function summaryAsText(msg: Message) {
   return `[${msg.role}]: ${textFromParts(msg.parts)}`;
 }
+/** 工具 part 的文本量(入参 JSON + 输出 text/error 条目)——工具往返在后续轮次全量进
+ *  提示词,不计=agent/MCP 重度会话严重低估(影响压缩触发与用量显示,§9.8)。 */
+function toolPartsTextVolume(parts: MessagePart[]) {
+  let volume = "";
+  for (const part of parts) {
+    if (!isRecord(part) || part.type !== "tool") continue;
+    volume += String(part.input ?? "");
+    if (!Array.isArray(part.output)) continue;
+    for (const entry of part.output) {
+      if (!isRecord(entry)) continue;
+      const errorText = (entry as { error?: unknown }).error;
+      if (entry.type === "text") volume += String(entry.text ?? "");
+      else if (typeof errorText === "string") volume += errorText;
+    }
+  }
+  return volume;
+}
+
 export function estimatePromptTokensForConversation(conversation: Conversation) {
-  return selectedConversationMessages(conversation)
-    .filter((msg) => msg.role !== "ASSISTANT")
-    .reduce((sum, msg) => sum + estimateTokens(textFromParts(msg.parts)), 0);
+  return selectedConversationMessages(conversation).reduce((sum, msg) => {
+    // 原口径保留:助手回答文本不计(历史近似),但挂在助手消息里的工具往返必须计。
+    const textTokens = msg.role !== "ASSISTANT" ? estimateTokens(textFromParts(msg.parts)) : 0;
+    return sum + textTokens + estimateTokens(toolPartsTextVolume(msg.parts));
+  }, 0);
 }
 
 export function ensureUsage(msg: Message, conversation?: Conversation) {
-  const existing = msg.usage;
-  if (existing && typeof existing === "object" && !Array.isArray(existing)) return;
-  const completionTokens = estimateTokens(textFromParts(msg.parts) || reasoningFromParts(msg.parts));
-  const promptTokens = conversation ? estimatePromptTokensForConversation(conversation) : 0;
+  const existing = msg.usage as Record<string, unknown> | null | undefined;
+  const usable = existing && typeof existing === "object" && !Array.isArray(existing);
+  // 字段级兜底(内测实锤,Kimi anthropic 兼容端点):message_start 只回 input_tokens,
+  // output_tokens 恒 0 且 message_delta 不带 usage——上游只回报一半。旧判定"任一字段
+  // 非零就全信上游"被 promptTokens 挡住,completionTokens 恒 0:TPS 行消失/失真、
+  // 输出统计恒 0。改为按字段兜底:真实值保留,缺失侧(0 值)单独估算补齐。
+  // 全 0 载荷(流式骨架每轮下沉 generationMs 的纯时长对象)自然落双侧估算,行为不变。
+  const promptReal = usable && Number(existing.promptTokens ?? 0) > 0;
+  // completion 判 >1 而非 >0:anthropic 流式 message_start.usage.output_tokens 是起始
+  // 计数(恒 1),最终值只来自 message_delta。Kimi coding 等兼容端点 message_delta 不带
+  // usage,起始值 1 残留下沉——对话模式已在 mergeClaudeUsage 源头剥离(output 只认
+  // message_delta),但工作区走 pi vendor 的 anthropic 客户端(message_start 照吸,
+  // vendor 只跟上游不可改),残留的 1 会挡住估算兜底 → TPS≈0。此处按语义收紧:1 是
+  // 协议起始计数的特征值,不是可信回报;真实回答恰为 1 token 的场景落估算后显示依旧
+  // ≈1(标 estimated),零伤害。
+  const completionReal = usable && Number(existing.completionTokens ?? 0) > 1;
+  if (promptReal && completionReal) return;
+  // 思考模型的输出=正文+思维链,两段都计(旧 || 短路曾把思维链整段丢掉,TPS 低估一个数量级)。
+  // 空段跳过:estimateTokens 有 max(1,·) 下限,空串也计 1,相加会虚增。
+  const visibleText = textFromParts(msg.parts);
+  const reasoningText = reasoningFromParts(msg.parts);
+  const estimatedCompletion =
+    (visibleText ? estimateTokens(visibleText) : 0) + (reasoningText ? estimateTokens(reasoningText) : 0);
+  const promptTokens = promptReal
+    ? Number(existing.promptTokens)
+    : conversation ? estimatePromptTokensForConversation(conversation) : 0;
+  const completionTokens = completionReal ? Number(existing.completionTokens) : estimatedCompletion;
   msg.usage = {
     promptTokens,
     completionTokens,
     totalTokens: promptTokens + completionTokens,
-    cachedTokens: 0,
+    // 上游回报过的缓存命中数是真实值,保留(Kimi 场景 cache_read 正常回报)。
+    cachedTokens: usable ? Number(existing.cachedTokens ?? 0) : 0,
+    // 只要有估算成分就标 estimated(统计页照旧排除),不冒充全真实。
     estimated: true,
+    // 估算只兜 token;骨架已累计的纯生成耗时是真实测量值,保留(速度=估算token/真实时长)。
+    ...(usable && Number(existing.generationMs ?? 0) > 0 ? { generationMs: Number(existing.generationMs) } : {}),
   };
   fillContextLimit(msg);
 }

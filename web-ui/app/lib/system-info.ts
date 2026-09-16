@@ -6,7 +6,7 @@ export interface SystemInfo {
   summary: string;
 }
 
-function isTauriEnvironment(): boolean {
+export function isTauriEnvironment(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
@@ -40,6 +40,12 @@ function fallbackInfo(): SystemInfo {
 }
 
 let cached: SystemInfo | null = null;
+
+/** 是否 Windows 平台(shell 路径等 Windows-only 设置的渲染开关)。
+ *  同步快照:summary 以 Windows 开头即视为 Windows;异步首判经 getSystemInfo 预热缓存。 */
+export function isWindowsPlatform(): boolean {
+  return (cached ?? fallbackInfo()).summary.startsWith("Windows");
+}
 
 export async function getSystemInfo(): Promise<SystemInfo> {
   if (cached) return cached;

@@ -76,6 +76,9 @@
     "save_failed": "Save failed",
     "autosaving": "Auto-saving...",
     "autosaved": "Saved automatically",
+    "autosave_failed": "Auto-save failed",
+    "autosave_failed_named": "Failed to auto-save {{name}}",
+    "autosave_failed_retry": "Save failed — click to retry",
     "delete": "Delete",
     "hide_key": "Hide API Key",
     "show_key": "Show API Key"
@@ -97,6 +100,14 @@
     "quit_app_hint": "Closes the window and ends the background process.",
     "quit_app_button": "Quit",
     "quit_failed": "Failed to quit",
+    "shell_title": "Terminal (bash)",
+    "shell_path": "Custom bash path",
+    "shell_path_placeholder": "Leave empty to auto-detect (system Git Bash or built-in terminal)",
+    "shell_path_hint": "The bash the AI uses to run commands. Leave empty to auto-detect; if detection fails, point to a full bash.exe path here (e.g. Cygwin/MSYS2).",
+    "shell_path_invalid": "Invalid path: point to an existing bash.exe",
+    "shell_recheck": "Re-check",
+    "shell_recheck_ok": "bash detected and ready",
+    "shell_recheck_fail": "Still no usable bash found",
     "opt": {
       "show_user_avatar": "Show user avatar",
       "show_assistant_bubble": "Show assistant bubble",
@@ -165,6 +176,7 @@
     "query": "Query",
     "balance_api_path": "Balance API Path",
     "balance_result_path": "Balance result path",
+    "balance_result_path_invalid": "Invalid expression. Supports paths (e.g. data.total_credits, list[0]) and + - * / ++ operators.",
     "test_summary": "Test summary",
     "test_summary_model": "Model: {{model}}",
     "testing": "Testing...",
@@ -411,7 +423,7 @@
     "no_request_body": "No request body recorded",
     "no_response_body": "No response body recorded",
     "clear": "Clear logs",
-    "clear_confirm": "Clear all request logs? This cannot be undone.",
+    "clear_confirm": "Clear the logs currently shown? This cannot be undone.",
     "cleared": "All request logs cleared",
     "field_time": "Time",
     "field_method": "Method",
@@ -476,6 +488,11 @@
     "variables_label": "Variables: ",
     "reset_default": "Reset to default",
     "done": "Done",
+    "compress_engine": {
+      "chat": "Chat engine",
+      "pi": "Workspace engine (pi)",
+      "pi_note": "The workspace engine uses pi's native compaction. This prompt ships with the engine and is read-only. Incremental updates and oversized turns use dedicated variants of the same scheme."
+    },
     "prompt": {
       "title": "Title generation prompt",
       "translate": "Translation prompt",
@@ -530,6 +547,7 @@
   "mcp": {
     "title": "MCP & extensions",
     "subtitle": "Manage MCP servers, prompt injections, lorebooks, quick messages and Agent Skills.",
+    "no_assistants": "No assistants to configure yet. Create one in the Assistants section first, then come back here.",
     "tab": {
       "mode": "Prompt injection",
       "lorebook": "Lorebook",
@@ -637,6 +655,8 @@
     "skill_imported": "Skill imported: {{name}}",
     "import_failed": "Import failed",
     "empty_skill": "No skills yet",
+    "skill_issues_title": "Validation",
+    "skill_unavailable_hint": "description is missing, so the AI engine will not load this skill (add it to the SKILL.md frontmatter)",
     "delete_skill_confirm": "Delete this skill?",
     "import_github": "Import from GitHub",
     "github_url_ph": "https://github.com/owner/repo or /tree/branch/sub/path",
@@ -868,7 +888,8 @@
       "hygiene_installers_cleaned": "Data directory cleanup: removed {{count}} outdated update installer leftovers",
       "hygiene_legacy_snapshot_cleaned": "Data directory cleanup: removed a legacy migration snapshot",
       "orphan_stats": "Attachment stats: {{orphans}} entries no longer referenced (~{{orphanMb}} MB); {{untracked}} untracked files (~{{untrackedMb}} MB). Nothing is deleted automatically; back up first if you want to clean up",
-      "hygiene_failed": "Data directory cleanup task failed; harmless, will retry on next launch"
+      "hygiene_failed": "Data directory cleanup task failed; harmless, will retry on next launch",
+      "output_limit_unknown": "The maximum output length for {{model}} is unknown; sent the conservative default {{fallback}}. If this model rejects it with an invalid max_tokens error, set the max output length manually in the assistant settings"
     }
   },
   "model_edit": {

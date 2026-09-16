@@ -15,7 +15,7 @@
 //     冻结点——此前 Claude/Google 停止后本轮工具仍会执行,违背用户"停止"心智)。
 // 其余仍为纯参数化差异(文案/编码格式等),不做无谓统一。
 import type { Assistant, Message, Provider } from "../foundation/types";
-import { initialApprovalState, toolNeedsApproval } from "../tools/approval";
+import { initialApprovalState } from "../tools/approval";
 import { toolExecutionErrorPayload } from "../tools/format";
 import { finishReasoningParts } from "./parts";
 import type { StreamHooksWithSink, ToolCall, ToolDispatchContext, ToolResult } from "./events";
@@ -39,12 +39,15 @@ export function mergeTokenUsage(prev: Message["usage"], next: Message["usage"]):
     return value > 0 ? value : Number(prevRec[key] ?? 0) || 0;
   };
   const contextLimit = nextRec.contextLimit !== undefined ? nextRec.contextLimit : prevRec.contextLimit;
+  // generationMs 单调累计(骨架每轮发的都是至今总和),新值>0 覆盖语义天然正确。
+  const generationMs = pick("generationMs");
   return {
     promptTokens: pick("promptTokens"),
     completionTokens: pick("completionTokens"),
     totalTokens: pick("totalTokens"),
     cachedTokens: pick("cachedTokens"),
     ...(contextLimit !== undefined ? { contextLimit: contextLimit as number | null } : {}),
+    ...(generationMs > 0 ? { generationMs } : {}),
   };
 }
 
@@ -196,6 +199,10 @@ export async function runStreamingToolLoop(
   let currentBody = initialBody;
   let allContent = "";
   let forceNonStream = false;
+  // 纯生成耗时累计(usage.generationMs):每轮"发请求→流读完"的成功轮时长之和。轮间
+  // 工具执行/审批不在计时窗内;失败轮(fetch 或读流抛错后降级重试)不计——统计行
+  // token/s 的语义是模型生成吞吐,等待与重试损耗不摊进去。
+  let generationMs = 0;
   // 专题9:助手"流式输出"关闭 → 从第一轮起就按非流式请求(工具循环的每一轮都非流式)。
   // 用户显式选择时 nonStreamFallback 的降级重试不再适用(已经是非流式,降无可降)。
   const userNonStream = assistant.streamOutput === false && adapter.makeNonStreamBody != null;
@@ -257,9 +264,21 @@ export async function runStreamingToolLoop(
       throw err;
     }
 
-    if (hooks.message && result.usage) {
-      if (hooks.sink) hooks.sink({ kind: "usage", usage: result.usage });
-      else hooks.message.usage = mergeTokenUsage(hooks.message.usage, result.usage);
+    generationMs += Date.now() - roundStarted;
+    if (hooks.message) {
+      // 即使本轮上游未回报 usage 也要下沉 generationMs 累计值:token 字段给 0,
+      // mergeTokenUsage 的 pick 语义会保留已知旧值,不会清零。
+      const roundUsage = result.usage && typeof result.usage === "object" && !Array.isArray(result.usage) ? result.usage : {};
+      const usagePayload = {
+        promptTokens: 0,
+        completionTokens: 0,
+        cachedTokens: 0,
+        totalTokens: 0,
+        ...roundUsage,
+        generationMs,
+      };
+      if (hooks.sink) hooks.sink({ kind: "usage", usage: usagePayload });
+      else hooks.message.usage = mergeTokenUsage(hooks.message.usage, usagePayload);
     }
 
     logRound(adapter, round, roundStarted, requestBody, {
@@ -285,9 +304,32 @@ export async function runStreamingToolLoop(
     }
 
     // 审批 pre-scan：批内任一工具需要用户审批就整批不执行（避免部分执行后下一轮缺
-    // tool_result）。工具卡已经/将要渲染为 pending 态，generateAnswer 看到
+    // tool_result）。此刻流已读完、参数齐备，这里是审批的终局判定（工作区工具在
+    // balanced 档依赖参数：危险命令/区外写入才审批）。generateAnswer 看到
     // hasPendingToolApproval 会暂停等用户决定。
-    const hasPendingInBatch = result.toolCalls.some((call) => toolNeedsApproval(call.name, assistant));
+    const approvalByCall = new Map(
+      result.toolCalls.map((call) => [call.id, initialApprovalState(call.name, assistant, hooks.conversation, call.arguments)] as const),
+    );
+    const hasPendingInBatch = [...approvalByCall.values()].some((state) => state.type === "pending");
+    // 流内建卡的 provider（Claude）在参数未到时用无参数下界建卡；终局若上调为
+    // pending，把卡状态同步上去（只升不降，auto 卡才会被改写）。Google 的函数调用
+    // 整体到达、建卡即终局，此处的重复 pending 同步幂等无害。
+    if (adapter.toolCardsCreatedInStream && hooks.message) {
+      for (const call of result.toolCalls) {
+        const finalState = approvalByCall.get(call.id)!;
+        if (finalState.type !== "pending") continue;
+        if (hooks.sink) {
+          hooks.sink({ kind: "tool_approval_updated", toolCallId: call.id, approvalState: finalState });
+        } else {
+          hooks.message.parts = hooks.message.parts.map((part) => {
+            if (!isRecord(part) || part.type !== "tool" || part.toolCallId !== call.id) return part;
+            const current = isRecord(part.approvalState) ? String(part.approvalState.type ?? "") : "";
+            return current === "auto" || current === "pending" ? { ...part, approvalState: finalState } : part;
+          });
+        }
+      }
+      if (hasPendingInBatch) touchStream(hooks);
+    }
     const dispatchCtx = toolCallContext(hooks);
     const toolResults: ExecutedToolResult[] = [];
 
@@ -303,7 +345,8 @@ export async function runStreamingToolLoop(
           toolName: call.name,
           input: call.arguments,
           output: [],
-          approvalState: initialApprovalState(call.name, assistant),
+          // 循环层建卡时参数已齐，直接用终局审批态（含缘由）
+          approvalState: approvalByCall.get(call.id) ?? initialApprovalState(call.name, assistant, hooks.conversation, call.arguments),
         };
         finishReasoningParts(hooks.message);
         hooks.sink?.({

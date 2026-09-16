@@ -13,11 +13,14 @@ import { generating } from "./conversations/generation-state";
 import { handleAuthTokenRequest, isWebAuthAuthorized, warnIfExposedWithoutAuth } from "./api/auth";
 import { routeStatic } from "./api/static";
 import { routeApi } from "./api/router";
+import { hasProxyForwardHeaders, isLoopbackAddress, markRequestNetworkContext } from "./api/net-context";
 import { loadModelsDev } from "./inference-engine/providers";
 import { checkpointConversationsDb, flushConvDirtyNow, getConversation, persistConversation } from "./conversations";
 
 import process from "node:process";
 import { installProcessSafetyNet, reportError } from "./observability/app-errors";
+import { bootCleanExit, bootMilestone, bootNote, bootTraceStartup, readPreviousCrashLog } from "./observability/boot-trace";
+import { killTrackedDetachedChildren } from "./workspace/tools/shell";
 import { maybeRunExtractionWorker } from "./files/extraction";
 
 // 全面审查 4-2:进程级异常兜底必须最早安装,罩住后续启动期与运行期的一切
@@ -30,11 +33,21 @@ if (await maybeRunExtractionWorker()) {
   process.exit(process.exitCode ?? 0);
 }
 
+// R1 取证:启动/崩溃黑匣子。尽早开——worker 分支已拐走,此处是正常实例的真正起点。
+// 内部先把上次可能残留的崩溃 pending 转存成 server.log,再为本次会话开 pending 标记;
+// 任何 IO 失败都静默降级(取证绝不阻塞启动)。干净退出时由 bootCleanExit 删净,正常用下来
+// logs/ 里什么都不留。
+bootTraceStartup();
+bootMilestone("进程拉起");
+
 // R1-4:壳(lib.rs)在 stdout 解析的单行诊断标记。release 壳下 stderr 不可见,启动失败
 // 的真实原因全靠它带出去;消息压成单行,壳原样弹窗展示。code 对齐 process.exit 码,
 // 当前仅供壳侧日志/未来分诊。
 function emitStartupFatal(code: number, message: string): void {
   console.log(`RIKKAHUB_FATAL:${code}:${message.replace(/\s*\r?\n\s*/g, " ")}`);
+  // R1 取证:JS 启动失败点也往 pending 落一行——进程即便在退出前来不及走干净路径,
+  // 这句也已留在 pending 里,下次启动 capture 转存后能看到真实原因。
+  bootNote("startupFatal", `[code ${code}] ${message}`);
 }
 
 // 1-5/R1-1:dataDir 单实例互斥必须先于绑端口——若后到实例先绑了端口再发现锁被占,
@@ -42,6 +55,7 @@ function emitStartupFatal(code: number, message: string): void {
 // bootstrap(状态装载+迁移链)则移到 Bun.serve 之后异步执行,见文件尾。
 try {
   acquireDataDirLock();
+  bootMilestone("已拿数据目录锁");
 } catch (err) {
   if (err instanceof DataDirLockedError) {
     emitStartupFatal(3, err.message);
@@ -191,11 +205,8 @@ const { server, port } = (() => {
                 // 也是 127.0.0.1,裸回环判定会被穿透——任何互联网客户端 POST 本端点即可无鉴权
                 // 停服。Tauri 壳直连本端口、绝不经代理,故带任一代理转发头的请求一定不是壳
                 // 发的,直接拒绝;回环判定继续拦真正的远程直连。
-                const viaProxy = request.headers.has("x-forwarded-for")
-                  || request.headers.has("x-real-ip")
-                  || request.headers.has("forwarded");
                 const ip = server.requestIP(request)?.address ?? "";
-                if (viaProxy || (ip !== "127.0.0.1" && ip !== "::1" && ip !== "::ffff:127.0.0.1")) {
+                if (hasProxyForwardHeaders(request) || !isLoopbackAddress(ip)) {
                   return error("Forbidden: shutdown is loopback-only", 403);
                 }
                 await flushAllStateBeforeExit();
@@ -218,7 +229,12 @@ const { server, port } = (() => {
                 const upgraded = server.upgrade(request, { data: { kind: "asr" } as any });
                 return upgraded ? undefined : error("WebSocket upgrade failed", 400);
               }
-              if (url.pathname.startsWith("/api/")) return await routeApi(request, url);
+              if (url.pathname.startsWith("/api/")) {
+                // 回环上下文标记:"仅限本机"端点(如 data/export/to-path 向宿主路径写文件)
+                // 在 handler 层经 net-context 查询;判定语义与上方 shutdown 闸同源。
+                markRequestNetworkContext(request, server.requestIP(request)?.address ?? "");
+                return await routeApi(request, url);
+              }
               return await routeStatic(url);
             } catch (err) {
               console.error(err);
@@ -297,6 +313,7 @@ const { server, port } = (() => {
 // the sidecar actually bound to — the shell navigates the webview here when 8080 was taken.
 // Keep it a single line with the exact `RIKKAHUB_PORT:<port>` prefix.
 setActualServingPort(port);
+bootMilestone("端口已绑定", `port=${port}`);
 console.log(`RIKKAHUB_PORT:${port}`);
 
 console.log(`RikkaHub PC server running at http://localhost:${port}`);
@@ -320,6 +337,22 @@ void (async () => {
     return;
   }
   markStartupReady();
+  bootMilestone("bootstrap 完成");
+  // R1 取证:上次未干净退出会留下 server.log。启动成功后按判读等级分流(日志问题 2):
+  //   abnormal(启动期夭折/运行期记录到异常)→ 错误中心浮 warn,用户应该知道;
+  //   external(里程碑全完成、无异常记录 → 外力终止:直接关机/强退/任务管理器)→ 静默留档,
+  //   这是托盘常驻用户的日常("点 X→托盘→关机"),报警只会制造"我明明正常关的"困惑。
+  // 两种等级的 server.log 都随"下次正常退出"被清,与"重启清零"天然一致,绝不弹窗打扰。
+  const previousCrash = readPreviousCrashLog();
+  if (previousCrash?.level === "abnormal") {
+    reportError(
+      "internal",
+      "warn",
+      "上次应用未正常退出(可能是异常崩溃或强制终止)。诊断信息见 数据目录/logs/server.log。",
+      undefined,
+      "previous_unclean_exit",
+    );
+  }
   warnIfExposedWithoutAuth(bindHostname);
   // R1-13:数据目录卫生(超龄 corrupt 隔离、过时安装包、化石快照、孤儿附件统计)。
   // 就绪后台执行,内部自捕获,绝不影响运行。
@@ -348,6 +381,7 @@ async function flushAllStateBeforeExit(): Promise<void> {
   // 放行退出,只释放实例锁。
   if (!isStartupReady()) {
     releaseDataDirLock();
+    bootCleanExit(); // R1 取证:未就绪干净退出(启动即被关)也算正常,删 pending 不留假报警。
     return;
   }
   try {
@@ -371,16 +405,24 @@ async function flushAllStateBeforeExit(): Promise<void> {
   }
   // 1-5:全部刷盘完成后释放 dataDir 锁(只删自己的;崩溃残留的陈旧锁由下次启动接管)。
   releaseDataDirLock();
+  // R1 取证:干净退出收尾——删本次 pending + 上次可能残留的 server.log("下次正常退出则
+  // 日志清除",关机/强退的假报警就此归零)。此后进程才 exit,文件生灭即"是否干净退出"的判据。
+  bootCleanExit();
 }
 
 async function shutdown() {
   server.stop(true);
+  // 工作区 bash 残留子进程清扫(M1-5)：detached 进程组不随宿主退出，不杀会变孤儿。
+  killTrackedDetachedChildren();
   await flushAllStateBeforeExit();
   process.exit(0);
 }
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+// SIGHUP:Windows 关闭终端窗口(libuv 把 CTRL_CLOSE_EVENT 映射为 SIGHUP,~5s 宽限)、
+// Unix 终端断开。dev 形态下"直接关终端"是高频操作,不挂就走硬杀留假崩溃档(日志问题 2)。
+process.on("SIGHUP", shutdown);
 
 if (!args.has("--dev") && !args.has("--no-open")) {
   const opener = process.platform === "win32" ? "cmd" : "sh";

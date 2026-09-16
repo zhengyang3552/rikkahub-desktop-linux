@@ -8,6 +8,7 @@
     "yesterday": "Yesterday",
     "unnamed_conversation": "Untitled conversation",
     "generating": "Generating",
+    "awaiting_approval": "Awaiting approval",
     "conversation_actions": "Conversation actions",
     "action_failed_retry": "Action failed. Please try again later.",
     "pin": "Pin",
@@ -97,7 +98,30 @@
     "source_code": "Source",
     "empty_content": "(empty)",
     "type_label": "Type: {{type}}",
-    "close_panel": "Close panel"
+    "close_panel": "Close panel",
+    "files": {
+      "title": "File panel",
+      "refresh": "Refresh",
+      "back": "Back",
+      "empty_dir": "Directory is empty",
+      "rename": "Rename",
+      "delete": "Delete",
+      "reveal": "Show in file explorer",
+      "cancel": "Cancel",
+      "confirm": "OK",
+      "delete_file_confirm": "Delete file {{name}}? This cannot be undone.",
+      "delete_dir_confirm": "Delete directory {{name}} and all its contents? This cannot be undone.",
+      "preview_truncated": "File is large; showing the first 512KB only",
+      "binary_preview": "Binary file ({{size}}), preview unavailable",
+      "workspace_missing": "Workspace missing or deleted",
+      "failed": "Operation failed",
+      "agents_edit": "Edit AGENTS.md",
+      "agents_dialog_title": "Edit {{name}}",
+      "agents_dialog_create_hint": "This workspace has no project instructions file yet. Below is a default template; saving it creates AGENTS.md, which the AI reads when working in this workspace.",
+      "agents_dialog_edit_hint": "The AI reads project instructions from this file when working in this workspace (changes apply from the next turn).",
+      "agents_save": "Save",
+      "agents_saved": "AGENTS.md saved"
+    }
   },
   "custom_theme_dialog": {
     "create_title": "New custom theme",
@@ -148,7 +172,10 @@
     "badge_generate": "Generated",
     "badge_edit": "Edited",
     "delete": "Delete",
-    "not_selected": "Not selected"
+    "not_selected": "Not selected",
+    "waiting_seconds": "Waiting {{seconds}}s",
+    "cancel": "Cancel",
+    "cancelled": "Generation cancelled"
   },
   "web_auth_gate": {
     "title": "Web API is locked",
@@ -164,6 +191,10 @@
     "description": "RikkaHub is loading data and finishing upgrade migrations. Large libraries can take a few minutes. Please keep the app open — it will continue automatically.",
     "failed_title": "Startup failed",
     "failed_description": "The server hit an error while starting or migrating data. Your original data has not been deleted; restarting the app will retry automatically. If this keeps happening, contact support with the details below:",
+    "retry": "Retry",
+    "copy_error": "Copy error details",
+    "copied": "Copied",
+    "report_issue": "Report issue",
     "phase": {
       "starting": "Starting the service",
       "load_state": "Loading application data",
@@ -209,6 +240,7 @@
     "apply_failed": "Failed to apply update"
   },
   "errors": {
+    "network_unreachable": "Cannot reach the local service. Please retry shortly; restart the app if this persists",
     "load_conversations_failed": "Failed to load conversations",
     "read_image_failed": "Failed to read image",
     "decode_image_failed": "Failed to decode image"

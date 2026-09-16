@@ -9,6 +9,9 @@ import {
   Clipboard,
   ClipboardPaste,
   Clock3,
+  FileSearch,
+  FileText,
+  FolderOpen,
   Globe,
   Loader2,
   MessageCircleQuestion,
@@ -29,7 +32,16 @@ import { resolveFileUrl } from "~/lib/files";
 import { cn } from "~/lib/utils";
 import type { TextPart as UITextPart, ToolPart as UIToolPart } from "~/types";
 
+import { workspaceToolKind } from "~/lib/workspace-tool-model";
+
 import { ControlledChainOfThoughtStep } from "../chain-of-thought";
+import {
+  WorkspaceApprovalCard,
+  ElapsedBadge,
+  workspaceReadTitle,
+  workspaceReconTitle,
+} from "./workspace-tool-part";
+import { useElapsedSeconds } from "~/hooks/use-elapsed-since";
 import { AudioPart as AudioPartRenderer } from "./audio-part";
 import { ImagePart as ImagePartRenderer } from "./image-part";
 import { VideoPart as VideoPartRenderer } from "./video-part";
@@ -37,6 +49,9 @@ import { VideoPart as VideoPartRenderer } from "./video-part";
 interface ToolPartProps {
   tool: UIToolPart;
   loading?: boolean;
+  /** 域3-1 耗时计时基准(消息级,由 message-part.tsx 统一透传)。 */
+  messageCreatedAt?: string;
+  messageFinishedAt?: string | null;
   onToolApproval?: (
     toolCallId: string,
     approved: boolean,
@@ -164,7 +179,7 @@ function SearchFavicon({
         className,
       )}
     >
-      <span className="flex h-full w-full items-center justify-center text-[0.625rem] font-semibold text-muted-foreground">
+      <span className="flex h-full w-full items-center justify-center text-micro font-semibold text-muted-foreground">
         {(domain[0] ?? "?").toUpperCase()}
       </span>
     </span>
@@ -223,7 +238,7 @@ function SearchResultMiniList({ items }: { items: unknown[] }) {
             />
             <span className="min-w-0 flex-1 truncate text-xs text-foreground">{title}</span>
             {domain ? (
-              <span className="shrink-0 text-[0.625rem] text-muted-foreground">{domain}</span>
+              <span className="shrink-0 text-micro text-muted-foreground">{domain}</span>
             ) : null}
           </div>
         );
@@ -233,6 +248,12 @@ function SearchResultMiniList({ items }: { items: unknown[] }) {
 }
 
 function getToolIcon(toolName: string, action?: string) {
+  // 工作区 read(M2-3):文件图标。write/edit/bash 已被抽出为顶层动作卡,不走本分派。
+  if (workspaceToolKind(toolName) === "read") return FileText;
+  // 兜底检索工具(grep/find/ls):与 read 同属侦察类,折叠组内用专属图标
+  if (toolName === "grep") return FileSearch;
+  if (toolName === "find") return FileSearch;
+  if (toolName === "ls") return FolderOpen;
   if (toolName === TOOL_NAMES.MEMORY) {
     if (action === MEMORY_ACTIONS.CREATE || action === MEMORY_ACTIONS.EDIT) {
       return BookHeart;
@@ -260,6 +281,15 @@ function getToolIcon(toolName: string, action?: string) {
 
 function getToolTitle(toolName: string, args: unknown, t: TFunction): string {
   const action = getStringField(args, "action");
+
+  {
+    // 工作区 read(M2-3):相对路径+offset/limit 徽标(方案 §4.3 单行步骤形态)。
+    const readTitle = workspaceReadTitle(toolName, JSON.stringify(args ?? {}), t);
+    if (readTitle) return readTitle;
+    // 兜底检索工具(grep/find/ls)的单行步骤标题
+    const reconTitle = workspaceReconTitle(toolName, JSON.stringify(args ?? {}), t);
+    if (reconTitle) return reconTitle;
+  }
 
   if (toolName === TOOL_NAMES.MEMORY) {
     if (action === MEMORY_ACTIONS.CREATE) return t("tool_part.memory_create");
@@ -388,7 +418,7 @@ function SearchWebPreview({ args, content }: { args: unknown; content: unknown }
                 <span className="min-w-0 flex-1">
                   <span className="flex items-center gap-2">
                     <span className="line-clamp-1 font-medium text-sm">{title || url}</span>
-                    <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[0.625rem] text-muted-foreground">
+                    <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-micro text-muted-foreground">
                       {domain}
                     </span>
                   </span>
@@ -500,7 +530,15 @@ function parseAskUserQuestions(args: unknown): AskUserQuestion[] {
   }
 }
 
-function AskUserToolStep({ tool, loading, onToolApproval, isFirst, isLast }: ToolPartProps) {
+function AskUserToolStep({
+  tool,
+  loading,
+  messageCreatedAt,
+  messageFinishedAt,
+  onToolApproval,
+  isFirst,
+  isLast,
+}: ToolPartProps) {
   const { t } = useTranslation("message");
   const [expanded, setExpanded] = React.useState(true);
 
@@ -510,6 +548,9 @@ function AskUserToolStep({ tool, loading, onToolApproval, isFirst, isLast }: Too
 
   const isPending = tool.approvalState.type === "pending";
   const isAnswered = tool.approvalState.type === "answered";
+
+  // 域3-1:等待用户答复的时长同样入账(等待+执行=用户体感的"这步多久"),终局定格。
+  const elapsedSeconds = useElapsedSeconds(messageCreatedAt, messageFinishedAt ?? null);
 
   const firstQuestion = questions[0]?.question ?? "...";
   const title =
@@ -639,6 +680,7 @@ function AskUserToolStep({ tool, loading, onToolApproval, isFirst, isLast }: Too
         )
       }
       label={<span className="text-foreground line-clamp-2 text-sm font-medium">{title}</span>}
+      extra={elapsedSeconds !== null ? <ElapsedBadge seconds={elapsedSeconds} running={Boolean(loading)} /> : undefined}
     >
       <div className="space-y-3 w-full">
         {questions.map((q) => (
@@ -661,6 +703,8 @@ function AskUserToolStep({ tool, loading, onToolApproval, isFirst, isLast }: Too
 export function ToolPart({
   tool,
   loading = false,
+  messageCreatedAt,
+  messageFinishedAt,
   onToolApproval,
   isFirst,
   isLast,
@@ -670,6 +714,8 @@ export function ToolPart({
       <AskUserToolStep
         tool={tool}
         loading={loading}
+        messageCreatedAt={messageCreatedAt}
+        messageFinishedAt={messageFinishedAt}
         onToolApproval={onToolApproval}
         isFirst={isFirst}
         isLast={isLast}
@@ -720,6 +766,8 @@ export function ToolPart({
 
   const canOpenDrawer = isPending || isExecuted;
   const Icon = getToolIcon(tool.toolName, memoryAction);
+  // 域3-1:运行耗时(等待审批+执行=这步的真实时长),与工作区动作卡同一计时口径。
+  const elapsedSeconds = useElapsedSeconds(messageCreatedAt, messageFinishedAt ?? null);
 
   const handleApprove = async (event: React.MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
@@ -752,16 +800,19 @@ export function ToolPart({
         }
         label={<span className="text-foreground line-clamp-2 text-sm font-medium">{title}</span>}
         extra={
-          isPending && onToolApproval ? (
-            <div className="flex items-center gap-1">
-              <Button onClick={handleDeny} size="icon-xs" type="button" variant="secondary">
-                <X className="h-3.5 w-3.5" />
-              </Button>
-              <Button onClick={handleApprove} size="icon-xs" type="button" variant="secondary">
-                <Check className="h-3.5 w-3.5" />
-              </Button>
-            </div>
-          ) : undefined
+          <span className="flex shrink-0 items-center gap-1.5">
+            {isPending && onToolApproval ? (
+              <span className="flex items-center gap-1">
+                <Button onClick={handleDeny} size="icon-xs" type="button" variant="secondary">
+                  <X className="h-3.5 w-3.5" />
+                </Button>
+                <Button onClick={handleApprove} size="icon-xs" type="button" variant="secondary">
+                  <Check className="h-3.5 w-3.5" />
+                </Button>
+              </span>
+            ) : null}
+            {elapsedSeconds !== null ? <ElapsedBadge seconds={elapsedSeconds} running={loading} /> : null}
+          </span>
         }
         onClick={canOpenDrawer ? () => setDrawerOpen(true) : undefined}
       >
@@ -937,18 +988,37 @@ export function ToolPart({
 export function PendingToolAttentionCard({
   tool,
   loading,
+  messageCreatedAt,
+  messageFinishedAt,
   onToolApproval,
 }: {
   tool: UIToolPart;
   loading?: boolean;
+  /** 域3-1:pending 期间持续计时(审批等待本身就是这步的耗时)。 */
+  messageCreatedAt?: string;
+  messageFinishedAt?: string | null;
   onToolApproval?: ToolPartProps["onToolApproval"];
 }) {
   const { t } = useTranslation("message");
+  const elapsedSeconds = useElapsedSeconds(messageCreatedAt, messageFinishedAt ?? null);
 
   // ask_user 已经有自己的专属醒目卡片（AskUserToolStep 内部的 pending 分支），
   // 不需要再多套一层 banner。
   if (tool.toolName === TOOL_NAMES.ASK_USER) {
-    return <AskUserToolStep tool={tool} loading={loading} onToolApproval={onToolApproval} />;
+    return (
+      <AskUserToolStep
+        tool={tool}
+        loading={loading}
+        messageCreatedAt={messageCreatedAt}
+        messageFinishedAt={messageFinishedAt}
+        onToolApproval={onToolApproval}
+      />
+    );
+  }
+
+  // 工作区工具(M2-3):专属审批卡——琥珀色左边条,完整展示将执行的命令/写入路径。
+  if (workspaceToolKind(tool.toolName)) {
+    return <WorkspaceApprovalCard tool={tool} onToolApproval={onToolApproval} />;
   }
 
   const args = (() => {
@@ -997,6 +1067,7 @@ export function PendingToolAttentionCard({
               {t("tool_part.pending_approval_title")}
             </span>
             <span className="size-1.5 animate-pulse rounded-full bg-primary" aria-hidden />
+            {elapsedSeconds !== null ? <ElapsedBadge seconds={elapsedSeconds} running /> : null}
           </div>
           <p className="text-xs text-muted-foreground">
             {t("tool_part.pending_approval_desc", { toolName: tool.toolName })}

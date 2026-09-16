@@ -3,41 +3,29 @@
 
 import { updateSettings } from "../app-config";
 import { fetchWithTimeout, readWithIdleTimeout } from "../foundation/net";
+import { evaluateJsonExpr, ParseError } from "../foundation/json-expression";
 import type { Assistant, Model, Provider } from "../foundation/types";
 import { state } from "../persistence/json-store";
 import { addLog } from "../api/logs";
 import { findAssistant } from "../assistants";
 import { applyCustomBody, jsonBody, modelsEndpointFor, normalizeFetchedModels, applyRequestHeaders, providerHeaders, providerTestCorePassed, providerTestModel, textBody } from "./index";
 import { hostOfProvider } from "../inference-engine/message-builder";
-import { deltaReasoningContent, deltaTextContent, parseSseChunks, responseEventToDelta } from "../inference-engine/providers";
+import { deltaReasoningContent, deltaTextContent, modelsDevCache, parseSseChunks, responseEventToDelta, upstreamHttpError } from "../inference-engine/providers";
+import { internalOutputCap } from "./model-limits";
 
-function getByPath(value: unknown, path: string): unknown {
-  const expression = path.trim();
-  if (!expression) return value;
-  const tokens = expression.match(/[^.[\]]+|\[(\d+)\]/g) ?? [];
-  let current: any = value;
-  for (const token of tokens) {
-    if (current == null) return undefined;
-    const indexMatch = /^\[(\d+)\]$/.exec(token);
-    current = indexMatch ? current[Number(indexMatch[1])] : current[token];
-  }
-  return current;
-}
-
-function formatBalanceValue(value: unknown) {
-  if (typeof value === "number" && Number.isFinite(value)) return value.toFixed(2);
-  const text = String(value ?? "").trim();
-  const num = Number(text);
-  return text && Number.isFinite(num) ? num.toFixed(2) : text;
-}
-
+/** 连通性测试的输出预算(我们的探测,不是用户的选择;经 internalOutputCap 收进模型上限)。 */
+const PROVIDER_TEST_OUTPUT_TOKENS = 4096;
 
 export function endpointFor(providerItem: Provider) {
   const base = providerItem.baseUrl.replace(/\/+$/, "");
   if (providerItem.type === "openai") {
     return providerItem.useResponseApi ? `${base}/responses` : `${base}${providerItem.chatCompletionsPath || "/chat/completions"}`;
   }
-  if (providerItem.type === "claude") return `${base}/messages`;
+  // claude 拼接标准化(A):剥尾部 /v1 再拼全路径 /v1/messages——与 pi 引擎 piBaseUrlFor
+  // 同款归一化,用户填 https://api.anthropic.com 或 .../v1 都能工作。此前 `${base}/messages`
+  // 要求 baseUrl 必须带 /v1,漏填即 404,且同一配置工作区(pi 剥 /v1 由 SDK 拼)能跑、
+  // 聊天挂——引擎间行为分歧。设置页 Base URL 预览(providers.tsx endpointPreview)同步同款规则。
+  if (providerItem.type === "claude") return `${base.replace(/\/v1$/, "")}/v1/messages`;
   return `${base}/models/{model}:generateContent`;
 }
 
@@ -92,7 +80,8 @@ export async function fetchProviderModels(providerItem: Provider) {
         preview: `The provider did not expose a model-list endpoint at ${endpoint}; using the configured local model templates.`,
       };
     }
-    throw new Error(`${response.status}: ${text.slice(0, 500) || response.statusText}`);
+    // B:404 形态诊断——报文带最终 URL(模型列表 404 是 Base URL 形态错误的高频信号)。
+    throw upstreamHttpError(providerItem, endpoint, response.status, text || response.statusText);
   }
   return { endpoint, models: normalizeFetchedModels(providerItem, raw), preview: textBody(text) };
 }
@@ -146,9 +135,20 @@ export async function fetchProviderBalance(providerItem: Provider) {
     error: response.ok ? undefined : textBody(text),
   });
   if (!response.ok) throw new Error(`余额查询失败：${response.status} ${text.slice(0, 500) || response.statusText}`);
-  const value = getByPath(raw, String(option.resultPath ?? ""));
-  const formatted = formatBalanceValue(value);
-  if (!formatted) throw new Error(`余额结果路径没有取到值：${option.resultPath || "(root)"}`);
+  // 余额取值走表达式 DSL(对齐 Android JsonExpression):支持路径 a.b / a[0] 与
+  // + - * / ++ 运算,故 OpenRouter 预设 `data.total_credits - data.total_usage` 能算出净余额。
+  const resultPath = String(option.resultPath ?? "").trim();
+  let value: string;
+  try {
+    value = evaluateJsonExpr(resultPath, raw);
+  } catch (err) {
+    if (err instanceof ParseError) throw new Error(`余额结果路径表达式无效：${resultPath || "(空)"}（${err.message}）`);
+    throw err;
+  }
+  // 数值一律两位小数展示;取不到值(空串)视为路径没命中,报错引导用户检查。
+  const numeric = Number(value);
+  const formatted = value.trim() !== "" && Number.isFinite(numeric) ? numeric.toFixed(2) : value.trim();
+  if (!formatted) throw new Error(`余额结果路径没有取到值：${resultPath || "(root)"}`);
   return { status: "ok", endpoint, value: formatted, preview: textBody(text) };
 }
 
@@ -181,7 +181,10 @@ function providerTestPayload(providerItem: Provider, mode: "non_stream" | "strea
   if (providerItem.type === "claude") {
     const body: any = {
       model: selectedModel,
-      max_tokens: 4096,
+      // Anthropic 协议 max_tokens 必填。连通性测试只要一句 "hello",4096 是我们给这个
+      // 探测定的预算(不是用户的选择)——经 internalOutputCap 收进模型真实上限,否则对
+      // 输出上限低于 4096 的模型(目录里有 cohere command-r 系 4000)测试会假失败。
+      max_tokens: internalOutputCap(modelsDevCache, providerItem, selectedModel, PROVIDER_TEST_OUTPUT_TOKENS),
       stream: mode === "stream",
       system: "You are a helpful assistant",
       messages: [{ role: "user", content: mode === "tools" ? "Use the get_current_time tool." : "hello" }],

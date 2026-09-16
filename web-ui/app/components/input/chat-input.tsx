@@ -6,15 +6,19 @@ import { toast } from "sonner";
 
 import { useCurrentAssistant } from "~/hooks/use-current-assistant";
 import { ModelList } from "~/components/input/model-list";
-import { ReasoningPickerButton } from "~/components/input/reasoning-picker";
 import { SearchPickerButton } from "~/components/input/search-picker";
-import { McpPickerButton } from "~/components/input/mcp-picker";
 import { MemoryBadge } from "~/components/memory/memory-badge";
 import { ExtensionPickerButton } from "~/components/input/extension-picker";
+import { CommandHighlightOverlay, SlashCommandMenu, TEXTAREA_METRICS } from "~/components/input/slash-command-menu";
+import { WorkspacePermissionPicker } from "~/components/input/workspace-permission-picker";
+import { WorkspaceFilesButton } from "~/components/input/workspace-files-button";
+import { useSlashCommand } from "~/hooks/use-slash-command";
+import { parseSlashCommand, type SlashCommandDto } from "~/lib/slash-commands";
 import { useChatInputStore, useSettingsStore } from "~/stores";
 import { Button } from "~/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "~/components/ui/dropdown-menu";
 import { Textarea } from "~/components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipTrigger } from "~/components/ui/tooltip";
 import { resolveFileUrl } from "~/lib/files";
 import { DOCUMENT_UPLOAD_ACCEPT, uploadFilesToDraft } from "~/lib/upload";
 import { cn } from "~/lib/utils";
@@ -39,6 +43,14 @@ export interface ChatInputProps {
   onSuggestionClick?: (suggestion: string) => void;
   onExportConversation?: (includeReasoning: boolean) => void;
   onCompressConversation?: () => void;
+  /** 斜杠指令:当前环境可用清单(服务端 GET /api/commands 权威判定;缺省/空 =
+   *  指令面整体关闭,推荐列表/染色/拦截均不生效)。 */
+  slashCommands?: SlashCommandDto[];
+  /** 斜杠指令拦截执行(完整指令提交时调用;输入框随即清空,不发消息)。执行中的
+   *  状态与结果反馈由执行器自理(压缩中提示/toast),不占用发送按钮。 */
+  /** 域5-1(3F):返回 Promise<boolean>;true/undefined=已受理(输入框维持清空),
+   *  false/抛错=未受理(输入框回填原始指令文本)。 */
+  onSlashCommand?: (name: string, argument: string) => Promise<boolean | void> | boolean | void;
   /** 产品决策①:安卓"清除上下文"对齐(切换语义,再点一次撤销)。 */
   // 提示词优化时,返回最近几轮对话的纯文本作为上下文(让优化模型理解模糊指代)。
   // 无对话(首条消息)时返回空串。只在用户点击"优化提示词"时调用。
@@ -47,6 +59,9 @@ export interface ChatInputProps {
 }
 
 const IMAGE_UPLOAD_ACCEPT = "image/*";
+
+const SLASH_MENU_ID = "chat-slash-command-menu";
+const EMPTY_SLASH_COMMANDS: SlashCommandDto[] = [];
 
 const ASR_FRAME_SIZE = 4096;
 
@@ -196,11 +211,19 @@ function useExtractionStatus(fileId: number | null, isDocument: boolean): Extrac
 
 /** 专题4:附件 chip 上的提取指示。解析中 = 进度圆圈(PDF 有逐页百分比,其他格式
  *  不定圈);失败/无文本 = 可悬停的警示角标;done/none = 不渲染,chip 恢复普通样子。
- *  发送永远不被提取阻塞——未完成时该文件走 fallback 占位文案(服务端 3-4 机制)。 */
+ *  域9-1(3B):解析状态同步进 chat-input store 的 parsingFileIds——发送门禁(按钮灰 +
+ *  发送键短路)读同一份数据,与本 chip 的进度圆圈严格同源,不另造轮询。 */
 function ExtractionBadge({ part }: { part: UIMessagePart }) {
   const { t } = useTranslation("input");
   const fileId = getPartFileId(part);
   const status = useExtractionStatus(fileId, part.type === "document");
+  const setPartParsing = useChatInputStore((state) => state.setPartParsing);
+  const parsing = status?.status === "pending";
+  React.useEffect(() => {
+    if (fileId == null) return;
+    setPartParsing(fileId, parsing);
+    if (parsing) return () => setPartParsing(fileId, false); // 卸载(附件被移除)即解除
+  }, [fileId, parsing, setPartParsing]);
   if (!status) return null;
   if (status.status === "pending") {
     const hasPageProgress = status.done != null && status.total != null && status.total > 0;
@@ -209,17 +232,27 @@ function ExtractionBadge({ part }: { part: UIMessagePart }) {
       ? t("chat.parsing_progress", { done: status.done, total: status.total })
       : t("chat.parsing");
     return (
-      <span className="inline-flex items-center" title={title}>
-        <ProgressRing percent={percent} />
-      </span>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex items-center">
+            <ProgressRing percent={percent} />
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>{title}</TooltipContent>
+      </Tooltip>
     );
   }
   if (status.status === "failed" || status.status === "empty") {
     const title = t(status.status === "failed" ? "chat.extraction_failed" : "chat.extraction_empty");
     return (
-      <span className="inline-flex items-center text-amber-500" title={title}>
-        <TriangleAlert className="size-3.5 shrink-0" />
-      </span>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex items-center text-warning">
+            <TriangleAlert className="size-3.5 shrink-0" />
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>{title}</TooltipContent>
+      </Tooltip>
     );
   }
   return null;
@@ -243,6 +276,8 @@ function ChatInputInner({
   onSuggestionClick,
   onExportConversation,
   onCompressConversation,
+  slashCommands,
+  onSlashCommand,
   getOptimizeContext,
   className,
 }: ChatInputProps) {
@@ -342,8 +377,49 @@ function ChatInputInner({
 
   const isEmpty = value.trim().length === 0 && attachments.length === 0;
 
+  // 域9-1(3B):任一草稿附件仍在解析 → 发送整体门禁(按钮灰 + 发送键短路,换行键保留)。
+  // 只阻塞"进行中";failed/empty 不阻塞——用户可自行决定带失败附件发送(走服务端降级)。
+  const parsingFileIds = useChatInputStore((state) => state.parsingFileIds);
+  const hasParsingAttachments = React.useMemo(() => {
+    if (parsingFileIds.length === 0) return false;
+    return attachments.some((part) => {
+      const fileId = getPartFileId(part);
+      return fileId != null && parsingFileIds.includes(fileId);
+    });
+  }, [attachments, parsingFileIds]);
+
+  // ── 斜杠指令(方案 tmp_doc/指令体系方案-2026-09-05.md §4/§5) ──────────────
+  // 指令面开关:带附件不拦截(附件+文本=用户想发消息);编辑历史消息不触发;
+  // 生成中禁用(与压缩互斥同语义)。清单为空 = 指令在此环境不存在(禁用不可见)。
+  const [imeComposing, setImeComposing] = React.useState(false);
+  const commandOverlayRef = React.useRef<HTMLDivElement | null>(null);
+  const slashEnabled =
+    ready && !disabled && !isGenerating && !isEditing && attachments.length === 0 && Boolean(onSlashCommand);
+  const availableSlashCommands = slashEnabled ? (slashCommands ?? EMPTY_SLASH_COMMANDS) : EMPTY_SLASH_COMMANDS;
+  const slash = useSlashCommand({
+    text: value,
+    commands: availableSlashCommands,
+    enabled: slashEnabled,
+    onCompleteText: onValueChange,
+  });
+  // 完整指令判定(拦截与染色共用同一判据);IME 组合中暂停染色——组合串只存在于
+  // textarea 层,文字透明会让组合过程不可见。
+  const parsedCommand = React.useMemo(
+    () => (slashEnabled ? parseSlashCommand(value, availableSlashCommands) : null),
+    [availableSlashCommands, slashEnabled, value],
+  );
+  const commandPainted = parsedCommand !== null && !imeComposing;
+  // 镜像挂载/文本变化时同步滚动位置(textarea 打字会自滚动)。
+  React.useEffect(() => {
+    const overlay = commandOverlayRef.current;
+    const textarea = textareaRef.current;
+    if (commandPainted && overlay && textarea) overlay.scrollTop = textarea.scrollTop;
+  }, [commandPainted, value]);
+
   const canStop = ready && Boolean(onStop) && isGenerating && !disabled;
-  const canSend = ready && !isGenerating && !disabled && !isEmpty;
+  // 域9-1:解析中门禁并入 canSend——canSend=false 时 actionDisabled 让发送按钮置灰,
+  // handlePrimaryAction 顶部 return 短路键盘路径;canStop(停止生成)不受附件解析影响。
+  const canSend = ready && !isGenerating && !disabled && !isEmpty && !hasParsingAttachments;
   // 生成中允许上传:用户常在模型输出时准备下一轮的 prompt 和附件,加文件到草稿和打字
   // 一样都不打断当前生成。submitting(发送的一瞬间)和 uploading 仍保留互斥。
   const canUpload = ready && !disabled && !uploading && !submitting;
@@ -386,6 +462,21 @@ function ChatInputInner({
       }
 
       if (canSend) {
+        // 斜杠指令拦截:完整指令不作为消息发送,清空输入框交执行器(方案 §3.5)。
+        // 域5-1(3F):执行器返回 false / 抛错 = 未受理(如压缩占用),把原始指令文本回填
+        // 输入框,用户键入的参数不丢。受理(默认 true)则维持"已清空"。
+        if (parsedCommand && onSlashCommand) {
+          const { command, argument } = parsedCommand;
+          const originalText = value;
+          onValueChange("");
+          try {
+            const accepted = await onSlashCommand(command.name, argument);
+            if (accepted === false) onValueChange(originalText);
+          } catch {
+            onValueChange(originalText);
+          }
+          return;
+        }
         setOriginalBeforeOptimize(null);
         await onSend();
       }
@@ -395,7 +486,7 @@ function ChatInputInner({
     } finally {
       setSubmitting(false);
     }
-  }, [actionDisabled, canSend, canStop, onSend, onStop, t]);
+  }, [actionDisabled, canSend, canStop, onSend, onSlashCommand, onStop, onValueChange, parsedCommand, t, value]);
 
   const handleOptimize = React.useCallback(async () => {
     const original = value.trim();
@@ -624,6 +715,19 @@ function ChatInputInner({
 
   const handleKeyDown = React.useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      // 斜杠推荐菜单优先消费(↑↓/Tab/Enter/Esc;菜单打开时 Enter=补全,绝不发送)。
+      if (slash.handleMenuKeyDown(event)) return;
+
+      // 域9-2(3D):编辑模式 Esc = 点"取消"按钮。菜单开着时上面已消费(第一次 Esc 只关
+      // 菜单);IME 组合输入中(isComposing)不响应,避免中/日文输入法取词 Esc 误退编辑。
+      if (event.key === "Escape") {
+        if (isEditing && !event.nativeEvent.isComposing) {
+          event.preventDefault();
+          onCancelEdit?.();
+        }
+        return;
+      }
+
       if (event.key !== "Enter") return;
       if (isGenerating) return;
       if (event.nativeEvent.isComposing) return;
@@ -632,12 +736,19 @@ function ChatInputInner({
       // sendOnEnter = true: Enter 发送，Shift+Enter 换行
       // sendOnEnter = false: Shift+Enter 发送，Enter 换行
       const shouldSend = sendOnEnter ? !event.shiftKey : event.shiftKey;
-      if (!shouldSend) return;
+      if (!shouldSend) return; // 换行角色的组合始终放行(域9-1:解析中也不动换行)
+
+      // 域9-1:发送角色的组合在附件解析中短路(不换行、不发送、不 preventDefault);
+      // 按钮侧已由 actionDisabled 置灰。toast 提示避免"按了没反应"的困惑。
+      if (hasParsingAttachments) {
+        toast.info(t("chat.parsing_send_blocked"));
+        return;
+      }
 
       event.preventDefault();
       void handlePrimaryAction();
     },
-    [handlePrimaryAction, isGenerating, sendOnEnter],
+    [handlePrimaryAction, hasParsingAttachments, isEditing, isGenerating, onCancelEdit, sendOnEnter, slash.handleMenuKeyDown, t],
   );
 
   const handleUploadInputChange = React.useCallback(
@@ -691,12 +802,7 @@ function ChatInputInner({
   const placeholder = ready ? t("chat.placeholder_ready") : t("chat.placeholder_not_ready");
 
   return (
-    <div
-      className={cn(
-        "bg-background/95 backdrop-blur supports-backdrop-filter:bg-background/60",
-        className,
-      )}
-    >
+    <div className={className}>
       <div className="mx-auto w-full max-w-3xl px-4 py-4">
         {/* 可拖拽的上沿手柄：上下拖改变输入框高度（左右锁定）。对标微信等桌面聊天
             应用，让用户按需放大/收起输入区，尺寸跨会话与重启保留。 */}
@@ -711,7 +817,18 @@ function ChatInputInner({
         >
           <div className="h-1 w-10 rounded-full bg-border/70 transition-colors hover:bg-primary/50" />
         </div>
-        <div className="relative flex flex-col gap-2 rounded-2xl border bg-card p-3 shadow-lg transition-shadow focus-within:shadow-elevated focus-within:ring-1 focus-within:ring-ring">
+        <div className="chat-input-box relative flex flex-col gap-2 rounded-[var(--ds-chat-composer-radius)] bg-[var(--ds-surface-input)] p-3">
+          {/* 斜杠指令推荐列表:锚定输入卡片上方,随输入实时过滤(方案 §4.2)。 */}
+          {slash.menuOpen ? (
+            <SlashCommandMenu
+              id={SLASH_MENU_ID}
+              commands={slash.matches}
+              selectedIndex={slash.selectedIndex}
+              query={slash.query}
+              onHover={slash.setSelectedIndex}
+              onPick={slash.pick}
+            />
+          ) : null}
           {/* 待确认记忆提醒角标:浮在输入框右上角外沿,像消息提醒。仅有待确认项时渲染。 */}
           <div className="absolute -top-4 right-2 z-10">
             <MemoryBadge />
@@ -729,26 +846,6 @@ function ChatInputInner({
               >
                 {t("chat.cancel_edit")}
               </Button>
-            </div>
-          ) : null}
-
-          {suggestions.length > 0 ? (
-            <div className="flex gap-2 overflow-x-auto rounded-lg px-1 py-1">
-              {suggestions.map((suggestion, index) => (
-                <button
-                  key={`${suggestion}-${index}`}
-                  type="button"
-                  disabled={!canUseQuickMessage}
-                  className={cn(
-                    "shrink-0 rounded-lg border bg-background px-3 py-1 text-xs text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50",
-                  )}
-                  onClick={() => {
-                    handleSuggestionSelect(suggestion);
-                  }}
-                >
-                  {suggestion}
-                </button>
-              ))}
             </div>
           ) : null}
 
@@ -812,20 +909,47 @@ function ChatInputInner({
             </div>
           ) : null}
 
-          <Textarea
-            ref={textareaRef}
-            value={value}
-            onChange={handleTextChange}
-            onKeyDown={handleKeyDown}
-            onPaste={(event) => {
-              void handlePaste(event);
-            }}
-            placeholder={placeholder}
-            disabled={!ready || disabled}
-            className="resize-none border-0 bg-transparent dark:bg-transparent p-2 text-sm shadow-none focus-visible:ring-0"
-            rows={2}
-            style={{ minHeight: `${inputMinHeight}px`, maxHeight: `${inputMaxHeight}px` }}
-          />
+          <div className="relative">
+            {/* 指令染色镜像层:命中完整指令时 textarea 文字透明化(光标保留),
+                由镜像以完全相同的度量渲染文本并把指令段染 --command 蓝。 */}
+            {commandPainted && parsedCommand ? (
+              <CommandHighlightOverlay
+                ref={commandOverlayRef}
+                text={value}
+                tokenLength={parsedCommand.tokenLength}
+              />
+            ) : null}
+            <Textarea
+              ref={textareaRef}
+              value={value}
+              onChange={handleTextChange}
+              onKeyDown={handleKeyDown}
+              onPaste={(event) => {
+                void handlePaste(event);
+              }}
+              onScroll={(event) => {
+                const overlay = commandOverlayRef.current;
+                if (overlay) overlay.scrollTop = event.currentTarget.scrollTop;
+              }}
+              onCompositionStart={() => setImeComposing(true)}
+              onCompositionEnd={() => setImeComposing(false)}
+              placeholder={placeholder}
+              disabled={!ready || disabled}
+              aria-controls={slash.menuOpen ? SLASH_MENU_ID : undefined}
+              aria-activedescendant={
+                slash.menuOpen && slash.matches[slash.selectedIndex]
+                  ? `${SLASH_MENU_ID}-option-${slash.matches[slash.selectedIndex].name}`
+                  : undefined
+              }
+              className={cn(
+                TEXTAREA_METRICS,
+                "resize-none border-0 bg-transparent dark:bg-transparent shadow-none hover:shadow-none focus-visible:shadow-none focus-visible:ring-0",
+                commandPainted && "text-transparent caret-[var(--ds-text-primary)]",
+              )}
+              rows={2}
+              style={{ minHeight: `${inputMinHeight}px`, maxHeight: `${inputMaxHeight}px` }}
+            />
+          </div>
           <div className="flex items-center justify-between gap-2">
             <div className="flex min-w-0 items-center gap-1">
               <DropdownMenu open={uploadMenuOpen} onOpenChange={setUploadMenuOpen}>
@@ -850,7 +974,7 @@ function ChatInputInner({
                     variant="ghost"
                     size="icon"
                     disabled={!canUpload}
-                    className="size-8 rounded-full text-muted-foreground hover:text-foreground"
+                    className="toolbar-btn size-8 rounded-full text-[var(--ds-icon)] hover:text-foreground"
                   >
                     <Plus
                       className={cn("size-4 transition-transform", uploadMenuOpen && "rotate-45")}
@@ -906,39 +1030,20 @@ function ChatInputInner({
                   )}
                 </DropdownMenuContent>
               </DropdownMenu>
-              <ModelList disabled={!canSwitchModel} className="max-w-64" />
-              <SearchPickerButton disabled={!canSwitchModel} />
-              <ReasoningPickerButton disabled={!canSwitchModel} />
-              <McpPickerButton disabled={!canSwitchModel} />
-              <ExtensionPickerButton disabled={!canSwitchModel} />
               <QuickMessageButton
                 quickMessages={quickMessages}
                 disabled={!canUseQuickMessage}
                 onSelect={handleQuickMessageSelect}
               />
-              <Button
-                type="button"
-                variant={asrListening ? "secondary" : "ghost"}
-                size="icon"
-                disabled={!canUseAsr && !asrListening}
-                className={cn(
-                  "size-8 rounded-full text-muted-foreground hover:text-foreground",
-                  asrListening && "text-primary shadow-sm",
-                )}
-                title={asrListening ? t("asr.stop") : t("asr.start")}
-                onClick={toggleAsr}
-              >
-                {asrListening ? (
-                  <LoaderCircle className="size-4 animate-spin" />
-                ) : (
-                  <Mic className="size-4" />
-                )}
-              </Button>
+              <SearchPickerButton disabled={!canSwitchModel} />
+              <ExtensionPickerButton disabled={!canSwitchModel} />
+              <WorkspaceFilesButton />
+              <WorkspacePermissionPicker />
             </div>
             <div className="relative flex items-center gap-1.5">
               {/* 优化较慢提示:浮在按钮组上方,绝对定位不挤占布局(原方案放底部会把整个输入区往下顶)。 */}
               {optimizeHint ? (
-                <span className="animate-pulse absolute -top-8 right-0 z-10 whitespace-nowrap rounded-md border bg-popover px-2 py-1 text-[0.6875rem] text-muted-foreground shadow-sm">
+                <span className="animate-pulse absolute -top-8 right-0 z-10 whitespace-nowrap rounded-md border bg-popover px-2 py-1 text-mini text-muted-foreground shadow-sm">
                   {optimizeHint}
                 </span>
               ) : null}
@@ -975,30 +1080,85 @@ function ChatInputInner({
                   {t("optimize.undo")}
                 </Button>
               ) : null}
+              <ModelList disabled={!canSwitchModel} className="max-w-56" />
+              {/* NewMax cpd-action-btn:语音/发送合一——空文本=麦克风(常驻底色),有文本=
+                  品牌色上箭头,录音=红底声纹条,生成中=红底停止。状态切换带宽度/配色过渡。 */}
               <Button
-                onClick={() => {
-                  void handlePrimaryAction();
-                }}
-                disabled={actionDisabled}
+                type="button"
+                variant="ghost"
                 size="icon"
+                disabled={
+                  isGenerating || !isEmpty ? actionDisabled : !canUseAsr && !asrListening
+                }
+                title={
+                  isGenerating
+                    ? t("chat.stop_generating")
+                    : asrListening
+                      ? t("asr.stop")
+                      : isEmpty
+                        ? t("asr.start")
+                        : hasParsingAttachments
+                          ? t("chat.parsing_send_blocked")
+                          : undefined
+                }
+                onClick={() => {
+                  if (isGenerating || !isEmpty) void handlePrimaryAction();
+                  else toggleAsr();
+                }}
                 className={cn(
-                  "size-9 rounded-full shadow-sm",
-                  isGenerating && !submitting
-                    ? "bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                    : "bg-primary text-primary-foreground hover:bg-primary/90",
+                  "cpd-action-btn size-8 rounded-full",
+                  isGenerating
+                    ? "cpd-action-btn--send !bg-destructive !text-white"
+                    : asrListening
+                      ? "cpd-action-btn--recording"
+                      : isEmpty
+                        ? "cpd-action-btn--idle toolbar-btn text-[var(--ds-icon)] hover:text-foreground"
+                        : "cpd-action-btn--send",
                 )}
               >
                 {submitting || uploading ? (
                   <LoaderCircle className="size-4 animate-spin" />
                 ) : isGenerating ? (
-                  <Square className="size-4" />
+                  <span className="cpd-icon-enter" key="stop">
+                    <Square className="size-4" />
+                  </span>
+                ) : asrListening ? (
+                  <span className="cpd-voice-bars" key="bars">
+                    <span />
+                    <span />
+                    <span />
+                  </span>
+                ) : isEmpty ? (
+                  <span className="cpd-icon-enter" key="mic">
+                    <Mic className="size-4" />
+                  </span>
                 ) : (
-                  <ArrowUp className="size-4" />
+                  <span className="cpd-icon-enter" key="send">
+                    <ArrowUp className="size-4" />
+                  </span>
                 )}
               </Button>
             </div>
           </div>
         </div>
+        {/* 建议问题 chips:置于输入卡下方(NewMax 形态),pill-bg 胶囊 + 品牌色 */}
+        {suggestions.length > 0 ? (
+          <div className="flex gap-1.5 overflow-x-auto px-1 pt-2">
+            {suggestions.map((suggestion, index) => (
+              <button
+                key={`${suggestion}-${index}`}
+                type="button"
+                disabled={!canUseQuickMessage}
+                className="inline-flex h-6 shrink-0 items-center rounded-full bg-[var(--ds-pill-bg)] px-2.5 text-xs font-medium text-[var(--ds-brand-primary)] transition-opacity hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={() => {
+                  handleSuggestionSelect(suggestion);
+                }}
+              >
+                {suggestion}
+              </button>
+            ))}
+          </div>
+        ) : null}
         <p className="mt-2 text-center text-xs text-muted-foreground">{sendHint}</p>
         {error ? <p className="mt-1 text-center text-xs text-destructive">{error}</p> : null}
       </div>
@@ -1037,7 +1197,7 @@ function QuickMessageButton({
           variant="ghost"
           size="icon"
           disabled={disabled}
-          className="size-8 rounded-full text-muted-foreground hover:text-foreground"
+          className="toolbar-btn size-8 rounded-full text-[var(--ds-icon)] hover:text-foreground"
         >
           <Zap className="size-4" />
         </Button>

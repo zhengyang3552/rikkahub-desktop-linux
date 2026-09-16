@@ -8,8 +8,9 @@
 //   4. 逐页进度——子进程 stdout 逐行上报 EXTRACT_PROGRESS,前端进度圆圈轮询消费。
 //
 // 单 exe 自孵化:cmd = [process.execPath, ...process.argv.slice(1)] 原样复刻本进程的
-// 启动命令(dev 下是 `bun server.ts`,编译单 exe 下就是 exe 自身),用环境变量
-// RIKKAHUB_EXTRACT_WORKER=1 让入口在绑端口/抢数据目录锁【之前】拐进 worker 分支。
+// 启动命令(dev 下是 `bun server.ts …`,编译单 exe 下 argv[1] 是 bunfs 虚拟入口路径、
+// exe 会照常跑自己嵌入的入口,该路径只当普通参数落进 args Set,不影响旗标判定),用
+// 环境变量 RIKKAHUB_EXTRACT_WORKER=1 让入口在绑端口/抢数据目录锁【之前】拐进 worker 分支。
 // Bun 的 process.argv 不含 --watch 等运行时旗标,不会复刻出常驻的 watch 子进程。
 //
 // 纪律:本模块只管"怎么跑提取",解析器本体在 files/index.ts;不修改业务状态。
@@ -31,6 +32,22 @@ export interface ExtractionStatus {
   /** PDF 逐页进度(其他格式解析快,没有中间进度,直接从 pending 跳到终态)。 */
   done: number | null;
   total: number | null;
+}
+
+// 逐 chunk 读子进程流。不用 `for await...of stream`:pi 0.84.2 升级把 @types/node 的
+// undici-types 拉进编译图,其全局 ReadableStream(stream/web)遮蔽了 lib.dom.iterable 的
+// 可迭代声明,Symbol.asyncIterator 在类型层丢失;显式 getReader() 与该全局声明之争无关。
+async function* streamChunks(stream: ReadableStream<Uint8Array>): AsyncGenerator<Uint8Array> {
+  const reader = stream.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) yield value;
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 // ── 父侧:任务登记簿 + 并发泵 ────────────────────────────────────────────────
@@ -119,14 +136,14 @@ async function runExtractionChild(entry: StoredFile): Promise<void> {
     let stderrText = "";
     const stderrDone = (async () => {
       const decoder = new TextDecoder();
-      for await (const chunk of child.stderr) {
+      for await (const chunk of streamChunks(child.stderr)) {
         if (stderrText.length < 4096) stderrText += decoder.decode(chunk, { stream: true });
       }
     })();
 
     const decoder = new TextDecoder();
     let lineBuffer = "";
-    for await (const chunk of child.stdout) {
+    for await (const chunk of streamChunks(child.stdout)) {
       armStallTimer();
       lineBuffer += decoder.decode(chunk, { stream: true });
       let newlineIdx: number;

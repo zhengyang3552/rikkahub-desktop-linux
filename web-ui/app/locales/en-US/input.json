@@ -1,4 +1,11 @@
 {
+  "commands": {
+    "menu_label": "Slash commands",
+    "compact": {
+      "description": "Compact the conversation context",
+      "argument_hint": "[instructions]"
+    }
+  },
   "mcp": {
     "title": "MCP",
     "description": "Select MCP servers available to this assistant",
@@ -53,6 +60,10 @@
         "description": "Use extensive reasoning to answer."
       },
       "xhigh": {
+        "label": "Ultra",
+        "description": "Use ultra-high reasoning budget to answer."
+      },
+      "max": {
         "label": "Max",
         "description": "Use maximum reasoning to answer."
       }
@@ -112,8 +123,10 @@
     "uploading_progress": "Uploading {{percent}}%",
     "parsing_progress": "Parsing page {{done}}/{{total}}",
     "parsing": "Parsing",
+    "parsing_send_blocked": "Attachment still parsing — you can send once it finishes",
     "extraction_failed": "Parsing failed: this file's text can't be attached when sending",
-    "extraction_empty": "No text could be extracted (scanned or unsupported file)"
+    "extraction_empty": "No text could be extracted (scanned or unsupported file)",
+    "stop_generating": "Stop generating"
   },
   "resize_handle": "Drag to resize the input box",
   "compress_history": "Compress conversation history",
@@ -134,5 +147,20 @@
     "mic_denied": "Cannot access the microphone",
     "start": "Voice input",
     "stop": "Stop voice input"
+  },
+  "workspace_permission": {
+    "title": "Workspace permissions",
+    "confirm_each": "Ask to approve",
+    "confirm_each_hint": "Always ask before tool actions",
+    "balanced": "Default permissions",
+    "balanced_hint": "Only ask for potentially unsafe actions",
+    "full_access": "Full access",
+    "full_access_hint": "Unrestricted access to files on this computer",
+    "save_failed": "Failed to save permission preset"
+  },
+  "integrations": {
+    "title": "MCP & Extensions",
+    "description": "Pick MCP tools and extensions for this assistant",
+    "tab_mcp": "MCP"
   }
 }

@@ -16,7 +16,7 @@ RUN mkdir -p /tools/bin && \
 #  — Stage 1: Build —
 # --platform=$BUILDPLATFORM ensures Bun runs natively (no QEMU emulation).
 # Cross-compilation to TARGETARCH is handled via Bun's --target flag below.
-FROM --platform=$BUILDPLATFORM docker.io/oven/bun:latest AS builder
+FROM --platform=$BUILDPLATFORM docker.io/oven/bun:1.4.0 AS builder
 ARG TARGETARCH
 
 WORKDIR /build
@@ -28,16 +28,33 @@ RUN bun install
 # Build web-ui SPA
 COPY web-ui/ ./
 
-# Bun's react-dom/server.bun.js lacks renderToPipeableStream needed by React Router's
-# SSR build step. Symlink the Node.js server bundle in its place.
-RUN rm -f node_modules/react-dom/server.bun.js \
-    && ln -sf server.node.js node_modules/react-dom/server.bun.js \
-    && rm -f node_modules/react-dom/cjs/react-dom-server.bun.development.js \
-    && ln -sf react-dom-server.node.development.js node_modules/react-dom/cjs/react-dom-server.bun.development.js \
-    && rm -f node_modules/react-dom/cjs/react-dom-server.bun.production.js \
-    && ln -sf react-dom-server.node.production.js node_modules/react-dom/cjs/react-dom-server.bun.production.js
+# Build web-ui SPA
+COPY web-ui/ ./
+
+# react-dom 19.2.4 的 server.bun.js 缺 renderToPipeableStream,用 node 入口覆盖它。
+RUN cd node_modules/react-dom && cp server.node.js server.bun.js
 
 RUN bun run build
+
+# pi/ 是 gitignore 的本地浅克隆(vendored 源码),不进构建上下文。pc-server 直接
+# import 其 TS 源码,缺它 bun build --compile 第一步解析 import 即失败。
+# 按 CLAUDE.md「pi vendor 维护手册」重建:浅克隆上游基线 + 应用 pi-patches/*.patch。
+# --no-install-recommends 防止 bookworm-slim 带 ca-certificates 缺失导致 https clone 失败。
+# 装 pi 自己的依赖(proper-lockfile/typebox/openai 等,bun build 会把它们一并打包)。
+# packages/ai/src/providers/data/.manifest.json 是构建期生成物、git 不跟踪,
+# 由 generate-models 从 models.dev 拉取生成。
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY pi-patches/ ./pi-patches/
+RUN git clone --filter=blob:none --no-checkout https://github.com/earendil-works/pi.git pi && \
+    cd pi && \
+    git checkout 5cd93f688aaab89dbb6dfa4aca535f21796ae185 && \
+    git reset --hard && \
+    git apply ../pi-patches/*.patch && \
+    bun install && \
+    cd packages/ai && bun run generate-models
 
 # Compile server — cross-compile to match the runtime platform.
 # Lay out a separate /build/pc-server subtree so we don't mix the pc-server lockfile

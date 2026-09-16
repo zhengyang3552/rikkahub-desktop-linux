@@ -22,14 +22,22 @@ export type ModelCallErrorAnnotation = {
   message: string;
 };
 
+/** 压缩发生点标记:压缩完成时打在"当时的最新一条消息"上(对话模式 auxiliary.ts /
+ *  工作区 orchestrator applyCapturedEngineCompactions)。前端据此在该消息下方渲染
+ *  "上下文已压缩"分割线——锚定用户发起压缩的位置,线上的会话已被压缩处理。
+ *  PC 特有注解,安卓导出时过滤(backup/export.ts PC_ONLY_ANNOTATION_TYPES)。 */
+export type CompactionBoundaryAnnotation = {
+  type: "compaction_boundary";
+};
+
 /** 注释判别联合(对齐安卓 UIMessageAnnotation)。 */
-export type UIMessageAnnotation = UrlCitationAnnotation | ModelCallErrorAnnotation;
+export type UIMessageAnnotation = UrlCitationAnnotation | ModelCallErrorAnnotation | CompactionBoundaryAnnotation;
 
 /** 专题3 批4:PC 注解判别符注册表(联合类型的运行时镜像)。UIMessageAnnotation 新增
  *  成员而不登记于此 = 编译失败(下方双向断言);登记后 android-contract-sync.test.ts
  *  会强制声明其安卓兼容性(安卓已知类型 or 导出过滤黑名单)。这样"新功能忘了惦记
  *  备份契约"会在编译/测试期爆炸,而不是在用户导入 APP 时爆炸。 */
-export const PC_MESSAGE_ANNOTATION_TYPES = ["url_citation", "model_call_error"] as const;
+export const PC_MESSAGE_ANNOTATION_TYPES = ["url_citation", "model_call_error", "compaction_boundary"] as const;
 type AssertTrue<T extends true> = T;
 type MutuallyEqual<A extends string, B extends string> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
 export type _AnnotationRegistryComplete = AssertTrue<
@@ -47,6 +55,10 @@ export type TokenUsage = {
   estimated?: boolean;
   /** 模型最大上下文窗口(models.dev 目录查得);null = 未知/无匹配,缺省 = 尚未回填。 */
   contextLimit?: number | null;
+  /** 纯生成耗时(毫秒,各轮"发请求→流读完"累计,不含轮间工具执行/审批等待;流式工具
+   *  循环骨架累计)。统计行 token/s 的分母——用全程墙钟会被工具执行时间稀释(内测
+   *  反馈)。缺省(旧数据/工作区 pi 路径)时前端回退全程时长。 */
+  generationMs?: number;
 };
 
 // ── 会话/消息 DTO ──────────────────────────────────────────────────
@@ -91,6 +103,22 @@ export type ConversationListDto = {
   createAt: number;
   updateAt: number;
   isGenerating: boolean;
+  /** 工作区归属(agent 模式):null = 对话模式。容器层按此分流会话列表。 */
+  workspaceId: string | null;
+};
+
+/** 工作区(agent 模式):workspaces 路由的元素。status 为运行时计算(missing=根目录丢失)。 */
+export type WorkspaceDto = {
+  id: string;
+  name: string;
+  type: "managed" | "folder";
+  root: string;
+  permissionPreset: "confirm_each" | "balanced" | "full_access";
+  trustedAt: number | null;
+  createAt: number;
+  updateAt: number;
+  lastAccessAt: number;
+  status: "ready" | "missing";
 };
 
 /** conversations/paged 响应包装。 */
@@ -149,6 +177,8 @@ export type AppErrorDomain =
   | "backup"
   | "network"
   | "tool"
+  | "workspace"
+  | "pi-engine"
   | "media"
   | "update"
   | "internal";
@@ -252,3 +282,30 @@ export type ConversationErrorEventDto = {
   type: "error";
   message: string;
 };
+
+/** 会话详情 SSE:pi 引擎瞬态状态(事件名 engine-status,P5)。压缩中/自动重试中的
+ *  状态条载荷,busy:false 即清除。不落库、不进快照,SSE 重连即重置(瞬态语义)。
+ *  与 inference-engine/events.ts 的 EngineStatus 同构(api/sse.ts 赋值做编译期契约校验;
+ *  foundation 不反向 import 引擎层,故此处独立声明)。 */
+export type EngineStatusEventDto =
+  | { busy: false }
+  | {
+      busy: true;
+      /** awaiting_approval(域4-1):审批挂起期间持续——外显等待,供侧栏/标签双态点
+       *  与桌面通知消费。与 events.ts EngineStatus 同构。 */
+      phase: "compacting" | "retrying" | "awaiting_approval";
+      /** compacting:manual/threshold/overflow;retrying 无。 */
+      reason?: string;
+      /** retrying:第几次/共几次。 */
+      attempt?: number;
+      maxAttempts?: number;
+      /** compacting(UI 历史压缩):分块进度。状态条渲染"(current/total)"。 */
+      progress?: { current: number; total: number };
+      /** 压缩/审批开始时刻(epoch ms,服务端权威)。状态条据此渲染"已处理/已等待 xx秒",SSE 重连
+       *  快照带回真实起点,切页回来计时连续。缺省时前端以首见 busy 帧时刻兜底。 */
+      startedAt?: number;
+      /** awaiting_approval:挂起等待的工具调用 id / 工具名 / 审批对象摘要(通知用)。 */
+      toolCallId?: string;
+      toolName?: string;
+      summary?: string;
+    };

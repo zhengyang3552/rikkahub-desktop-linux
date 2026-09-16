@@ -1,9 +1,10 @@
 // api/handlers/conversations.ts — 会话路由（stream、batch-delete、列表/分页/搜索、单会话子路由）
 // 纪律：纯搬迁自 server.ts routeApi()；生成编排（generateAnswer 等）仍在 server.ts，经导入使用。
 
-import type { Conversation, ConversationSnapshotEventDto, ConversationSnapshotMetaEventDto, JsonValue, MessageNode, MessagePart } from "../../foundation/types";
+import type { Conversation, ConversationSnapshotEventDto, ConversationSnapshotMetaEventDto, EngineStatusEventDto, JsonValue, MessageNode, MessagePart } from "../../foundation/types";
 import type { ConversationListDto, ConversationNodesPageDto, MessageSearchResultDto, PagedResult } from "../../foundation/types";
 import { applyPlaceholders, id, message, textFromParts } from "../../foundation/utils";
+import { CodedError } from "../../foundation/errors";
 import { state } from "../../persistence/json-store";
 import {
   getConversation,
@@ -23,6 +24,7 @@ import { conversationNegotiationToken } from "../snapshot-negotiation";
 import { nodeStamp, SNAPSHOT_NODE_WINDOW, toSnapshotConversationDto } from "../snapshot-window";
 import {
   broadcastConversation,
+  broadcastEngineStatus,
   broadcastList,
   broadcastNodeUpdate,
   conversationClients,
@@ -31,9 +33,11 @@ import {
 import { bumpAnalyticsMsgCount } from "../../app-config/analytics";
 import { DEFAULT_TRANSLATION_PROMPT } from "../../app-config/prompts";
 import { attachOcrToImageParts, compressConversation, englishLanguageName, fetchAuxiliaryText, generateTitleForConversation, isQwenMtModel, markOcrPendingParts } from "../../conversations/auxiliary";
-import { generateAnswer } from "../../conversations/orchestrator";
+import { compactEngineConversation, generateAnswer, resolveEngineForConversation } from "../../conversations/orchestrator";
 import { deleteConversationsById, ensureConversation, findAssistant, finishInterruptedPendingToolsInConversation, hasPendingToolApproval } from "../../conversations/helpers";
-import { generating } from "../../conversations/generation-state";
+import { awaitingApproval, compressing, generating } from "../../conversations/generation-state";
+import { getWorkspace } from "../../workspace";
+import { resolveToolApproval } from "../../inference-engine/approval-gate";
 
 export async function handleConversationRoutes(request: Request, url: URL, path: string): Promise<Response | null> {
   // 列表失效事件已并入 /api/events 通道(invalidate 事件);会话详情流保持独立端点
@@ -53,7 +57,10 @@ export async function handleConversationRoutes(request: Request, url: URL, path:
   if (path === "conversations" && request.method === "GET") {
     const db = getConversationsDb();
     const metas = db ? listConversationMetas(db, state.settings.assistantId) : [];
-    return json(metas.map((item) => toListDto(item, generating.has(item.id))));
+    // 侧边栏绿灯在生成或压缩中都点亮(内测拍板:压缩也是会话忙碌,全局视野要可见;
+    // 绿点样式/文案不区分两态,就是原来的绿灯)。detail/快照面的 isGenerating 不掺
+    // 压缩——那是"停止生成"按钮的语义,压缩取消走压缩框自己的通道。
+    return json(metas.map((item) => toListDto(item, generating.has(item.id) || compressing.has(item.id))));
   }
   // J 族(专题2):排序+分页全在 SQL 侧(复合索引扫描,O(页大小)),不再把该助手全部
   // 元数据读入 JS——数千会话时列表刷新与 invalidate 风暴的单次成本与总量解耦。
@@ -70,7 +77,7 @@ export async function handleConversationRoutes(request: Request, url: URL, path:
       ? pagedConversationMetas(db, state.settings.assistantId, offset, limit)
       : { items: [], total: 0 };
     const paged: PagedResult<ConversationListDto> = {
-      items: items.map((item) => toListDto(item, generating.has(item.id))),
+      items: items.map((item) => toListDto(item, generating.has(item.id) || compressing.has(item.id))),
       nextOffset: offset + limit < total ? offset + limit : null,
       hasMore: offset + limit < total,
     };
@@ -109,8 +116,30 @@ export async function handleConversationRoutes(request: Request, url: URL, path:
       clientToken && clientToken === currentToken
         ? ["snapshot_meta", { type: "snapshot_meta", seq: Date.now(), conversationId: conversation.id, updateAt: conversation.updateAt, isGenerating: generating.has(conversation.id), negotiationToken: currentToken, serverTime: Date.now() } satisfies ConversationSnapshotMetaEventDto]
         : ["snapshot", { type: "snapshot", seq: Date.now(), conversation: toSnapshotConversationDto(conversation, generating.has(conversation.id)), serverTime: Date.now(), negotiationToken: currentToken } satisfies ConversationSnapshotEventDto];
+    // engine-status 帧是瞬态语义(重连即重置),压缩跨页/重连存活靠这份连接期快照:
+    // 压缩进行中(compressing 注册表,服务端权威)则补发状态条帧(含 startedAt,
+    // "已处理 xx秒"计时跨重连连续),切页回来即恢复显示。
+    const compressStartedAt = compressing.get(conversation.id);
+    // 域4-1:审批等待同哲学——等待中(awaitingApproval 注册表)补发琥珀态帧,侧栏/
+    // 标签双态点与"已等待 xx秒"跨切页/重连续存。压缩与审批互斥(压缩时无工具执行),
+    // 但快照逻辑各自独立判定,不互斥假设。
+    const pendingApproval = awaitingApproval.get(conversation.id);
+    const statusFrames: [string, JsonValue | object][] = [];
+    if (compressStartedAt) {
+      statusFrames.push(["engine-status", { busy: true, phase: "compacting", startedAt: compressStartedAt } satisfies EngineStatusEventDto]);
+    }
+    if (pendingApproval) {
+      statusFrames.push(["engine-status", {
+        busy: true,
+        phase: "awaiting_approval",
+        startedAt: pendingApproval.startedAt,
+        ...(pendingApproval.toolName ? { toolName: pendingApproval.toolName } : {}),
+        ...(pendingApproval.summary ? { summary: pendingApproval.summary } : {}),
+      } satisfies EngineStatusEventDto]);
+    }
+    const initialFrames: [string, JsonValue | object][] = [initialFrame, ...statusFrames];
     return openSse(
-      () => [initialFrame],
+      () => initialFrames,
       (controller) => {
         const set = conversationClients.get(conversation.id) ?? new Set<ReadableStreamDefaultController<Uint8Array>>();
         set.add(controller);
@@ -129,8 +158,18 @@ export async function handleConversationRoutes(request: Request, url: URL, path:
       deleteConversationsById(new Set([conversationId]));
       return new Response(null, { status: 204 });
     }
+    // messages POST 的 body 在 ensureConversation 之前读:工作区绑定是创建期属性,
+    // 必须随建档请求生效(会话首条消息才建档,事后无绑定时机)。body 只读这一次,
+    // 下方 messages 分支复用。绑定前校验工作区存在,防悬空引用。
+    let messagesBody: { parts?: JsonValue[]; workspaceId?: string } | null = null;
+    if (sub === "messages" && request.method === "POST") {
+      messagesBody = await readJson<{ parts?: JsonValue[]; workspaceId?: string }>(request);
+      if (messagesBody.workspaceId && !getWorkspace(String(messagesBody.workspaceId))) {
+        return error("Workspace not found", 404);
+      }
+    }
     const conversation = (sub === "messages" || sub === "system-prompt") && request.method === "POST"
-      ? ensureConversation(conversationId)
+      ? ensureConversation(conversationId, messagesBody?.workspaceId ? { workspaceId: String(messagesBody.workspaceId) } : undefined)
       : getConversation(conversationId);
     if (!conversation) return error("Conversation not found", 404);
     // DB-first:整个子路由块持有引用——translate/OCR 等长 await 期间实例不得被 sweep
@@ -163,7 +202,14 @@ export async function handleConversationRoutes(request: Request, url: URL, path:
       return json(page);
     }
     if (sub === "messages" && request.method === "POST") {
-      const body = await readJson<{ parts: JsonValue[] }>(request);
+      // 压缩互斥(审计修复):compressConversation 完成时用"压缩开始时的消息快照"整体
+      // 覆盖 conversation.messages——压缩窗口(LLM 摘要可达数十秒)内写入的新消息会被
+      // 静默吞掉。send/regenerate/edit 三写入口一律 409,复用 compress_in_progress
+      // 业务码(前端按码查 i18n,message 兜底)。auxiliary 落库防线是第二道保险。
+      if (compressing.has(conversation.id)) {
+        return error("已有压缩正在进行，请稍候", 409, "compress_in_progress");
+      }
+      const body = messagesBody ?? {};
       const assistant = findAssistant(conversation.assistantId);
       const picked = findModel(assistant.chatModelId ?? state.settings.chatModelId);
       // 用户在 ask_user 等待中直接发新消息时，旧 generation 可能还在跑（不太常
@@ -300,6 +346,10 @@ export async function handleConversationRoutes(request: Request, url: URL, path:
       return json({ status: "updated", title: conversation.title });
     }
     if (sub === "regenerate" && request.method === "POST") {
+      // 压缩互斥:理由见 send 入口(压缩落库覆盖期间写入)。
+      if (compressing.has(conversation.id)) {
+        return error("已有压缩正在进行，请稍候", 409, "compress_in_progress");
+      }
       const body = await readJson<{ messageId?: string }>(request);
       // 2-1:对齐 send 入口——先中止进行中的旧流。否则 generateAnswer 的 generating.set
       // 直接顶掉旧 controller,旧流成为无主流:与新流同写一个节点,或对已摘除节点持续
@@ -385,6 +435,10 @@ export async function handleConversationRoutes(request: Request, url: URL, path:
     }
     const messageEdit = sub.match(/^messages\/([^/]+)\/edit$/);
     if (messageEdit && request.method === "POST") {
+      // 压缩互斥:理由见 send 入口(压缩落库覆盖期间写入)。
+      if (compressing.has(conversation.id)) {
+        return error("已有压缩正在进行，请稍候", 409, "compress_in_progress");
+      }
       const body = await readJson<{ parts?: JsonValue[] }>(request);
       // 2-1:对齐 send 入口——先中止进行中的旧流。否则 generateAnswer 的 generating.set
       // 直接顶掉旧 controller,旧流成为无主流:与新流同写一个节点,或对已摘除节点持续
@@ -508,13 +562,35 @@ export async function handleConversationRoutes(request: Request, url: URL, path:
     }
     if (sub === "compress" && request.method === "POST") {
       const body = await readJson<{ additionalPrompt?: string; targetTokens?: number; keepRecentMessages?: number }>(request);
+      // 并发防线:前端 busy 互斥是组件态(切页即失忆),服务端必须自带守卫——两个压缩
+      // 并发改写同一会话是数据竞争。
+      if (compressing.has(conversation.id)) {
+        return error("已有压缩正在进行，请稍候", 409, "compress_in_progress");
+      }
       // 2-1:对齐 send 入口——先中止进行中的旧流。否则 generateAnswer 的 generating.set
       // 直接顶掉旧 controller,旧流成为无主流:与新流同写一个节点,或对已摘除节点持续
       // touchStream 广播幽灵帧。UI 虽屏蔽流式中的按钮,但 API 层必须自带守卫。
       generating.get(conversation.id)?.abort();
       generating.delete(conversation.id);
       finishInterruptedPendingToolsInConversation(conversation);
+      // 压缩状态服务端权威(内测反馈:切页回来"过程条消失",误以为压缩被取消):
+      // 开始/结束广播 engine-status(对话模式 UI 压缩从此与工作区引擎压缩同一状态条),
+      // compressing 集合供 SSE 连接期补发快照(engine-status 帧瞬态,重连即重置)。
+      const compressStartedAt = Date.now();
+      compressing.set(conversation.id, compressStartedAt);
+      broadcastEngineStatus(conversation.id, { busy: true, phase: "compacting", startedAt: compressStartedAt });
+      broadcastList(); // 侧边栏绿灯即时点亮(列表 isGenerating 含压缩中)
       try {
+        // P5:手动压缩优先走引擎原生 compaction——压引擎记忆(它才决定发给上游的
+        // 上下文),UI 历史不动。targetTokens/keepRecentMessages 是 UI 历史压缩的参数,
+        // 对引擎压缩无意义,只透传 additionalPrompt 作自定义指示。
+        // 压缩路由收编:经注册表分发(与生成路由同源),每个引擎自带压缩机制;
+        // 命中引擎无 compact 能力(chat)或工作区不可用(pi 不命中、落 chat 兜底)
+        // 返回 null → 回落 UI 历史压缩,与生成路由降级一致。engine 报真实命中引擎。
+        const engineResult = await compactEngineConversation(conversation, String(body.additionalPrompt ?? ""), request.signal);
+        if (engineResult) {
+          return json({ status: "compressed", engine: engineResult.engine, summaries: [engineResult.summary] });
+        }
         // R7-4:透传 request.signal——客户端取消(压缩框取消键)后,compressConversation
         // 在分块间与落库前检查,保证取消后不改写会话。
         const summaries = await compressConversation(
@@ -526,7 +602,19 @@ export async function handleConversationRoutes(request: Request, url: URL, path:
         );
         return json({ status: "compressed", summaries });
       } catch (err) {
-        return error(err instanceof Error ? err.message : String(err), 400);
+        // 用户中止(请求 signal 断)是正常路径不是故障:静默吞掉,不写错误中心、不刷全局
+        // toast——前端的取消 feedback 在发起侧(取消键/Esc 的 toast.info)。其余错误照常上浮。
+        if (err instanceof DOMException && err.name === "AbortError") {
+          return json({ status: "aborted" });
+        }
+        // CodedError 透传业务码,前端按码查 i18n 文案(message 兜底,通道见 foundation/errors)。
+        const errorCode = err instanceof CodedError ? err.errorCode : undefined;
+        return error(err instanceof Error ? err.message : String(err), 400, errorCode);
+      } finally {
+        compressing.delete(conversation.id);
+        // 与工作区路径 orchestrator 的 finally busy:false 重复广播,幂等无害。
+        broadcastEngineStatus(conversation.id, { busy: false });
+        broadcastList(); // 绿灯熄灭
       }
     }
     if (sub === "fork" && request.method === "POST") {
@@ -539,14 +627,17 @@ export async function handleConversationRoutes(request: Request, url: URL, path:
       // forkConversationAtMessage 的 Uuid.random() 行为;消息 id 与 Android 一致保留。
       const forkedNodes = (JSON.parse(JSON.stringify(conversation.messages.slice(0, nodeIndex + 1))) as MessageNode[])
         .map((node) => ({ ...node, id: id() }));
+      const forkId = id();
       const fork: Conversation = {
         ...JSON.parse(JSON.stringify(conversation)),
-        id: id(),
+        id: forkId,
         title: conversation.title ? `${conversation.title} Fork` : "Fork",
         messages: forkedNodes,
         isPinned: false,
         createAt: Date.now(),
         updateAt: Date.now(),
+        // P7:压缩记录随上方深拷贝整体复制;切点消息不在 fork 前缀内的记录,编码器按
+        // "切点在场"自校验自动跳过,fork 无需感知压缩语义(P5 的 jsonl 副本复制随层退役)。
       };
       registerConversation(fork); // fork 树复制自内存源会话,内存即权威
       persistConversation(fork);
@@ -574,6 +665,21 @@ export async function handleConversationRoutes(request: Request, url: URL, path:
       conversation.updateAt = Date.now();
       persistConversation(conversation);
       broadcastConversation(conversation);
+      // P3(方案 §4.4):审批内化后优先送达在途等待者(approval-gate 汇合),生成保持
+      // 在跑,execute 原地放行/拒绝——不走"暂停→重触发续跑"。
+      // 审批旁路判定收编(原 B-2 登记点):无等待者时"是否重触发"改问注册表的
+      // resumeSemantics,不再以"工作区可用"旁路推断引擎——与生成路由同源,第三引擎
+      // 接入时本端点自动跟随其声明的语义。run-and-suspend 引擎(pi)即使无等待者
+      // (生成已死的孤儿审批:重启/停止后才点卡)也只记录状态:该类引擎无续跑模型,
+      // 重触发会向引擎记忆重复注入末条用户消息;引擎侧悬空 toolCall 由 pi 在下轮
+      // 请求时自愈(pi/packages/ai transform-messages 注入合成空结果)。
+      const consumed = resolveToolApproval(conversation.id, String(body.toolCallId ?? ""), {
+        approved: body.approved === true,
+        ...(body.reason ? { reason: String(body.reason) } : {}),
+      });
+      if (consumed || resolveEngineForConversation(conversation).resumeSemantics === "run-and-suspend") {
+        return json({ status: "accepted" }, { status: 202 });
+      }
       const hasPendingTools = conversation.messages.some((node) =>
         node.messages.some((msg) => hasPendingToolApproval(msg))
       );

@@ -3,6 +3,7 @@
 // regex 带 method 门控），领域内严格保序 → 行为不变。
 
 import { JsonBodyError, error } from "./request";
+import { handleCommandRoutes } from "./handlers/commands";
 import { handleConversationRoutes } from "./handlers/conversations";
 import { handleDataRoutes } from "./handlers/data";
 import { handleErrorRoutes } from "./handlers/errors";
@@ -13,12 +14,15 @@ import { handleSettingsRoutes } from "./handlers/settings";
 import { handleSkillRoutes } from "./handlers/skills";
 import { handleSystemRoutes } from "./handlers/system";
 import { handleUpdateRoutes } from "./handlers/update";
+import { handleWorkspaceRoutes } from "./handlers/workspaces";
 
 const handlers = [
   handleSystemRoutes,
   handleSettingsRoutes,
   handleMemoryRoutes,
+  handleCommandRoutes,
   handleConversationRoutes,
+  handleWorkspaceRoutes,
   handleFileRoutes,
   handleSkillRoutes,
   handleDataRoutes,
