@@ -1,35 +1,35 @@
 -----BEGIN PGP SIGNED MESSAGE-----
 Hash: SHA512
 
-Date: Wed, 19 Aug 2026 11:00:48 +0000
+Date: Wed, 16 Sep 2026 05:17:05 +0000
 Description: rikkahub-desktop Linux packages
 Label: rikkahub-desktop
 Origin: rikkahub-desktop
 MD5Sum:
- d6a8d3f9425d59412c6f92b7316dff7d              824 Packages
- b54ef4d43afd0bb6eb0aa88490506157              557 Packages.gz
+ 767fda02e421d6c432797eb69d6108f5             1670 Packages
+ 8a83c4e178f8fbd2b254595a9a62a53c              654 Packages.gz
 SHA1:
- 6dfaa987b267b5c59a46de538e3a8a9ae12049f7              824 Packages
- 2c3e9212cc96c32407ecfd351979cbed24d6b076              557 Packages.gz
+ 493a027f86b4959ab654e55b440f7281c5f781fc             1670 Packages
+ 9c9a4634ac49fae3e9138a0a1207d2eb040b1bbe              654 Packages.gz
 SHA256:
- d18e2d1e4c2684fe0595a38505a6fad9f3bee32ee1661a443b57d19ef4ad4f90              824 Packages
- 8f6beb607dcb367c1f1c070fd2163a672293b5f71c71c7119e23440679f4919e              557 Packages.gz
+ ca5a66cc49c98295e11677c0ea12a99dba133a9c646a07e4e5331b4d0a661804             1670 Packages
+ bb3ee642d4c4c46f029633544825f12a191efde358b909b715967962e1164a75              654 Packages.gz
 SHA512:
- f3acf82b003dfa6dd5694becafeba370f7d1fd1ed143c80289cbf901b25eed2088f16e34aa50e1f8dc023c743dc05d1e730519d47829d13065539a4ac0dbcbf2              824 Packages
- 0d9bc0f750ee945fae60125c6efbd5b0dbd5943d3ba7dbac2d485365a5f35bae15907a66b52ead387a3f97f5d46709f2fedc843c74e89308ace4850479c416a7              557 Packages.gz
+ afdaf52c787b9b92458374b2d9d37610b25033747f9052652abaf0c2186caa666a5e283becaad05ebbebc28e6fd30d018c84f046628b10681bd36099c5746ea2             1670 Packages
+ 438934cf10bf842aa5d9126ee27918214bf7f6dc0c9b9489915845542043da25a4d589801ae146b02880b212efefeea2944a47de72237597eb36ba26103923af              654 Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEE6yVXJr8m8TGe6n12/w8dJT2aCwcFAmqFjOEACgkQ/w8dJT2a
-CwfjUA/8CDMkXq0lpVYgkxzJiKFbwyWJoFvId0I+9TqGD/JKYkGIf1+vx7G14YEG
-oZrZtzr8LELy17PHAVKTZlkSG2U5MqEVegH3N/gpcIi1ojfKDY6W/Mldo9SDQqc/
-Qp+KcgXKvxpZ1ldvY6CvbPxkXxaAhHrI5+EMnUnojFw/s/k2mYOViOQ/RX68xWwQ
-xyLZviPDpxiSXFsOQNZQXI55YSZ/d10uXfVOXDleez9cpK9KOuFxY7byC8xtjjFi
-vslxPnWNq8A2E7PI9b4NRzDB550WrzOrKcPo3ZPI9xROLBzIyl/GwedwWEYRISGf
-8L25blLrRWrhZME1CMpJzpaB2/Ee725KbPocfOHEsE+oL326WSIlIG2k6cqJsndK
-r8pUjLL1AwG3mnKvq0R+tpfMhV7SDaliahZ6aFp4UePB8cW7/+2/7WBigHViBDoT
-yz9z5kHPL2bg3rb4UmXII+0qpG+SWFCXpcy1f7BTs5gnXQHHjyA1PAH0Y6zajkNT
-JuE8R9GtVoP4Tv53L0rOvY+xpnDYc4cUIIeR1Q16klo64wM6WWaCUForNIZeNiP/
-cOtyxAfL42RnvOGaRVByJ9IrqdndO//4f2UfyQseFw9paG73m8vt8vY1zw10Xmdf
-lSuDqKH6XhFuCG0uvVOyhnoC0wTZzaXoYUhlBledRYzvqNj+bgk=
-=He8O
+iQIzBAEBCgAdFiEE6yVXJr8m8TGe6n12/w8dJT2aCwcFAmqqJlEACgkQ/w8dJT2a
+CwcKLRAArRPWBIWGyhesLETzTKrpV8hR5fVoRCBUut+/+Nphf8VtTmOp1R8udaCN
+lR/m+Q0DWrCMzOhmiddyrK/+p/IkOuBJ/ic/kC1w5P8PSPimR1hbPBPasdO3ddW/
+E21rPAbpMwbfROltRx47W5inpHQfGIDyvlN70iPjxaIucwQvHoyj1j7S8910n2R3
+1u9PxIclw5GqKRNBqIilVE8ngR/viV4mwA5yzPjSOP0o0ruL/R4MnoPmeC3nSJHX
+zl1HFD9MDb8w8cuEajyqqakVnPdL7qCUAUvhSQFtGhQ0DJh3Ilcuk3/i9P0l5RYz
+5aneGwAUHLEvxhT/JB+oYUkkE/E3K23Zec5O/oh3Rkw8G5BBkGsiFVxoan4JgcLv
+9Yio4v2u1qOin8pJ4wH2j9H70avClbevL9n7pS7repetDnfHc0RuoGFOXy5CS1gg
+TW1GhWcb/t7N0t3ziAZhAhy9K1CSaivFUFph9unk+MNR9GefewmGU89IqHlzvGKC
+pbEejlikgitHGiSlPB9LDXj27gDSqyOmtUZuLt87nzcnfXVnFaO6mJWClr2MwK9N
+a8ghm3xlGomKOfZF7c2O4/QJvqiC8E0tLDCyziOjp+2gZNRfTH3XDGRy++wtKimN
+yeNTVv597nahdUOyYcUdxrzhXq/iOreh226+cN8qdJvXzojjS0I=
+=27Sd
 -----END PGP SIGNATURE-----
